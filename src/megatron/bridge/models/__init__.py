@@ -25,6 +25,11 @@ from megatron.bridge.models.conversion.param_mapping import (
     ReplicatedMapping,
     RowParallelMapping,
 )
+from megatron.bridge.models.apertus import (
+    ApertusBridge,
+    ApertusModelProvider,
+    ApertusModelProvider8B,
+)
 from megatron.bridge.models.deepseek import (
     DeepSeekModelProvider,
     DeepSeekProvider,
@@ -215,6 +220,10 @@ __all__ = [
     "ReplicatedMapping",
     "RowParallelMapping",
     "AutoMapping",
+    # Apertus Models
+    "ApertusBridge",
+    "ApertusModelProvider",
+    "ApertusModelProvider8B",
     "Gemma3ModelProvider",
     "Gemma3ModelProvider1B",
     "Gemma3ModelProvider4B",
