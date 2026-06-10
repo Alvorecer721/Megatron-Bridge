@@ -19,9 +19,9 @@ Apertus is a Swiss AI model based on Llama architecture with:
 - QK normalization
 - Llama3-style RoPE scaling
 
-Usage:
-    export PYTHONPATH=/path/to/swiss-ai-megatron-lm:$PYTHONPATH
-    python convert_checkpoints.py import --hf-model swiss-ai/Apertus-8B-2509 --trust-remote-code ...
+Runs on stock megatron-core:
+    >>> from megatron.bridge import AutoBridge
+    >>> bridge = AutoBridge.from_hf_pretrained("swiss-ai/Apertus-8B-2509")
 """
 
 import torch
@@ -33,12 +33,13 @@ from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     QKVMapping,
 )
+from megatron.bridge.models.conversion.transformers_compat import (
+    rope_scaling_factor_from_hf,
+    rope_theta_from_hf,
+)
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider
 
-# Apertus uses a custom model class that requires trust_remote_code
-# We register by model name string to avoid loading the model at import time
-# String-based registration matches the HF model's architecture name
 
 @MegatronModelBridge.register_bridge(source="ApertusForCausalLM", target=GPTModel)
 class ApertusBridge(MegatronModelBridge):
@@ -54,42 +55,30 @@ class ApertusBridge(MegatronModelBridge):
 
     Example:
         >>> from megatron.bridge import AutoBridge
-        >>> bridge = AutoBridge.from_hf_pretrained(
-        ...     "swiss-ai/Apertus-8B-2509",
-        ...     trust_remote_code=True
-        ... )
+        >>> bridge = AutoBridge.from_hf_pretrained("swiss-ai/Apertus-8B-2509")
         >>> provider = bridge.to_megatron_provider()
     """
 
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
         hf_config = hf_pretrained.config
 
-        # RoPE config: transformers v5 consolidates rope_theta + rope_scaling
-        # into a single rope_parameters dict; v4-era configs expose separate
-        # attributes. Accept both shapes, never fall back silently.
-        rope_params = dict(getattr(hf_config, "rope_parameters", None) or {})
-        if not rope_params:
-            rope_params = dict(getattr(hf_config, "rope_scaling", None) or {})
-        if "rope_theta" not in rope_params:
-            theta = getattr(hf_config, "rope_theta", None)
-            if theta is None:
-                raise ValueError(
-                    "Could not determine rope_theta from HF config "
-                    "(checked rope_parameters and rope_theta attributes)."
-                )
-            rope_params["rope_theta"] = theta
-        rotary_base = rope_params["rope_theta"]
-
-        rope_type = rope_params.get("rope_type", rope_params.get("type", "default"))
+        # theta + factor via the shared v4/v5 compat helpers; rope_type and the
+        # llama3 sub-params are not exposed by the helpers, so read the raw
+        # dict (rope_parameters in transformers >=5.0, rope_scaling before).
+        rotary_base = rope_theta_from_hf(hf_config)
+        rope_scaling_factor = rope_scaling_factor_from_hf(hf_config, default=1.0)
+        rope_dict = (
+            getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
+        )
+        rope_type = rope_dict.get("rope_type", rope_dict.get("type", "default"))
         if rope_type not in ("default", "llama3"):
             raise ValueError(f"Unsupported rope_type {rope_type!r} for Apertus (expected default or llama3).")
         rope_scaling = rope_type == "llama3"
-        rope_scaling_factor = rope_params.get("factor", 1.0)
         if rope_scaling:
             # mcore's native llama3 scaling hardcodes these — validate the HF
             # config matches before silently building a different model.
             fixed = {"low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
-            mismatched = {k: rope_params.get(k, v) for k, v in fixed.items() if rope_params.get(k, v) != v}
+            mismatched = {k: rope_dict.get(k, v) for k, v in fixed.items() if rope_dict.get(k, v) != v}
             if mismatched:
                 raise ValueError(
                     f"Apertus rope_scaling has non-default llama3 parameters {mismatched}; "
@@ -146,18 +135,9 @@ class ApertusBridge(MegatronModelBridge):
             "output_layer.weight": "lm_head.weight",
             "decoder.final_layernorm.weight": "model.norm.weight",
 
-            # ======================================================================
-            # Layer norms - Swiss AI / older megatron-core (separate layernorm modules)
-            # Use these mappings when running with Swiss AI Megatron-LM fork
-            # ======================================================================
-            "decoder.layers.*.input_layernorm.weight": "model.layers.*.attention_layernorm.weight",
-            "decoder.layers.*.pre_mlp_layernorm.weight": "model.layers.*.feedforward_layernorm.weight",
-
-            # ======================================================================
-            # Layer norms - newer megatron-core (fused layernorm in linear layers)
-            # Use these mappings when running with /opt/megatron-lm or newer megatron-core
-            # After conversion, run rename_checkpoint_keys.py to convert to Swiss AI format
-            # ======================================================================
+            # Layer norms: TE-fused in Megatron (the provider always builds the
+            # TE spec); HF uses nonstandard names (attention_layernorm /
+            # feedforward_layernorm instead of input/post_attention_layernorm)
             "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.attention_layernorm.weight",
             "decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.feedforward_layernorm.weight",
 
