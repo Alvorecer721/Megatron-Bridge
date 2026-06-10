@@ -12,39 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Phase-2 parity gate: AutoBridge-built Megatron model vs HF eager, real checkpoint.
+"""Parity gate: AutoBridge-built Megatron model vs HF eager, real checkpoint.
 
 Compares logits at short context AND past the rope_scaling original context
-(8192), where the llama3 factor-32 scaling must be active — the regression
-this gate exists to catch. Requires 1 GPU (~40GB free) and the checkpoint.
+(8192), where the llama3 scaling must be active — the regression this gate
+exists to catch. Requires 1 GPU (~40GB free) and an HF-format checkpoint.
 
 Run:
-    PYTHONPATH=<deps>:<bridge>/src:<xielu-site> python test_checkpoint_parity.py [ckpt_path]
+    PYTHONPATH=<bridge>/src[:<xielu-site>] python test_checkpoint_parity.py <ckpt_path>
 Exit code 0 = parity holds.
 """
 
 import gc
 import logging
-import os
 import sys
 
 import torch
 
+from _test_harness import check, dist_init, finish
+
 logging.basicConfig(level=logging.INFO)  # surface the XIELU dispatch-path log
 
 CKPT = sys.argv[1] if len(sys.argv) > 1 else (
-    "/capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus-1p5-8B-sft-16k-lr6e-5-constant-it38036"
+    "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
 )
 SEQ_LENS = [128, 12288]  # 12288 > original_max_position_embeddings=8192 -> scaling active
 TAIL = 32  # positions compared exactly; full sequence compared by argmax agreement
-
-failures = []
-
-
-def check(name, cond, detail=""):
-    print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}", flush=True)
-    if not cond:
-        failures.append(name)
 
 
 def make_ids(seq_len, seed):
@@ -55,34 +48,26 @@ def make_ids(seq_len, seed):
 def hf_forward():
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(CKPT, torch_dtype=torch.bfloat16).cuda().eval()
+    model = AutoModelForCausalLM.from_pretrained(CKPT, torch_dtype=torch.bfloat16, device_map="cuda").eval()
+    vocab = model.config.vocab_size
     out = {}
     with torch.no_grad():
         for s in SEQ_LENS:
             ids = make_ids(s, seed=s)
             logits = model(input_ids=ids).logits
-            top2 = logits[0].float().topk(2, dim=-1)
-            out[s] = (logits[0, -TAIL:].float().cpu(), top2.indices[:, 0].cpu(), top2.values.cpu())
+            top2 = logits[0].topk(2, dim=-1)  # bf16 topk: avoids a full-vocab fp32 temporary
+            out[s] = (logits[0, -TAIL:].float().cpu(), top2.indices[:, 0].cpu(), top2.values.float().cpu())
             del logits, top2
     del model
     gc.collect()
     torch.cuda.empty_cache()
-    return out
+    return out, vocab
 
 
-def megatron_forward():
-    from megatron.core import parallel_state
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
+def megatron_forward(vocab):
     from megatron.bridge import AutoBridge
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29521")
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group("nccl", world_size=1, rank=0)
-    parallel_state.initialize_model_parallel(1, 1)
-    model_parallel_cuda_manual_seed(42)
-
+    dist_init(port=29521)
     bridge = AutoBridge.from_hf_pretrained(CKPT)
     models = bridge.to_megatron_model(load_weights=True, wrap_with_ddp=False)
     model = models[0].cuda().eval()
@@ -95,7 +80,7 @@ def megatron_forward():
             logits = model(input_ids=ids, position_ids=pos, attention_mask=None)
             if logits.shape[0] != 1:  # [s, b, v] -> [b, s, v]
                 logits = logits.transpose(0, 1)
-            logits = logits[..., :266752]  # drop any vocab padding
+            logits = logits[..., :vocab]  # drop padded-vocab columns
             out[s] = (logits[0, -TAIL:].float().cpu(), logits[0].argmax(-1).cpu())
             del logits
     return out
@@ -103,9 +88,9 @@ def megatron_forward():
 
 def main():
     print(f"checkpoint: {CKPT}", flush=True)
-    hf = hf_forward()
+    hf, vocab = hf_forward()
     print("HF forward done", flush=True)
-    mg = megatron_forward()
+    mg = megatron_forward(vocab)
     print("Megatron forward done", flush=True)
 
     for s in SEQ_LENS:
@@ -129,8 +114,7 @@ def main():
             f"mean_abs={mean_diff:.4f} max_abs={max_diff:.4f}",
         )
 
-    print(f"\n{len(failures)} failure(s)" if failures else "\nCHECKPOINT PARITY GATE PASSED", flush=True)
-    sys.exit(1 if failures else 0)
+    finish()
 
 
 if __name__ == "__main__":
