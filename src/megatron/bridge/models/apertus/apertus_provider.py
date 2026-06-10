@@ -14,46 +14,50 @@
 
 """Apertus Model Provider for Swiss AI Apertus models.
 
-Apertus uses XIELU activation which has learnable parameters (alpha_p, alpha_n).
-Requires Swiss AI Megatron-LM in PYTHONPATH for the XIELU implementation.
-
-Usage:
-    export PYTHONPATH=/path/to/swiss-ai-megatron-lm:$PYTHONPATH
-    python convert_checkpoints.py import --hf-model swiss-ai/Apertus-8B-2509 ...
+Runs on stock megatron-core: XIELU is owned by the bridge
+(megatron.bridge.models.apertus.xielu) and instantiated as a module
+activation through the layer spec, and Llama3-style RoPE scaling is
+applied in provide() following the Llama3.1 provider pattern.
 """
 
-import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
-from megatron.bridge.models.gpt_provider import GPTModelProvider
+from megatron.core.transformer.spec_utils import ModuleSpec
 
-# Import XIELU - works with both stock megatron-lm and Swiss AI Megatron-LM
-try:
-    from megatron.training.activations import XIELU
-    HAS_XIELU = True
-except ImportError:
-    HAS_XIELU = False
-    XIELU = None
+from megatron.bridge.models.apertus.xielu import XIELU
+from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
+from megatron.bridge.models.llama.llama_provider import apply_rope_scaling
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from megatron.core.models.gpt.gpt_model import GPTModel as MCoreGPTModel
+
+
+def apertus_layer_spec(config: "ApertusModelProvider") -> ModuleSpec:
+    """Default layer spec with XIELU wired in as a module activation.
+
+    The spec path (use_te_activation_func + MLPSubmodules.activation_func)
+    makes mcore's MLP instantiate XIELU as a submodule, so its learnable
+    alpha_p/alpha_n become ``mlp.activation_func.*`` parameters.
+    """
+    spec = default_layer_spec(config)
+    spec.submodules.mlp.submodules.activation_func = ModuleSpec(module=XIELU)
+    return spec
 
 
 @dataclass
 class ApertusModelProvider(GPTModelProvider):
-    """Configuration class for Apertus models (swiss-ai/Apertus-8B-2509).
+    """Configuration class for Apertus models.
 
     Apertus is based on Llama architecture with:
-    - XIELU activation function (learnable alpha_p, alpha_n parameters)
-    - QK normalization enabled
-    - Llama3-style RoPE scaling (8x from 8K to 64K context)
-
-    Requires Swiss AI Megatron-LM in PYTHONPATH for XIELU support.
+    - XIELU activation (learnable alpha_p, alpha_n; NOT a gated MLP)
+    - QK normalization
+    - Llama3-style RoPE scaling, parameterized by the HF ``rope_scaling`` dict
     """
 
     # Core architecture settings (Llama-like but NOT gated MLP)
     normalization: str = "RMSNorm"
-    gated_linear_unit: bool = False  # Apertus uses XIELU activation, NOT gated MLP like SwiGLU
+    gated_linear_unit: bool = False
     position_embedding_type: str = "rope"
     add_bias_linear: bool = False
     attention_dropout: float = 0.0
@@ -63,10 +67,18 @@ class ApertusModelProvider(GPTModelProvider):
     # Apertus-specific: QK normalization
     qk_layernorm: bool = True
 
-    # RoPE scaling factor (Llama3-style)
-    scale_factor: float = 8.0
+    # XIELU is built from the layer spec as a module activation
+    use_te_activation_func: bool = True
+    transformer_layer_spec: Union[ModuleSpec, Callable[["GPTModelProvider"], ModuleSpec]] = apertus_layer_spec
 
-    # Fusions - disable bias_activation_fusion since XIELU is custom
+    # Llama3-style RoPE scaling, populated from the HF rope_scaling dict.
+    # scale_factor=None means the checkpoint uses no scaling.
+    scale_factor: Optional[float] = None
+    low_freq_factor: float = 1.0
+    high_freq_factor: float = 4.0
+    old_context_len: int = 8192
+
+    # Fusions — bias_activation_fusion must stay off for a module activation
     bias_activation_fusion: bool = False
     masked_softmax_fusion: bool = True
     persist_layer_norm: bool = True
@@ -74,34 +86,30 @@ class ApertusModelProvider(GPTModelProvider):
     apply_rope_fusion: bool = True
     use_transformer_engine_op_fuser: Optional[bool] = None
 
-    def __post_init__(self):
-        super().__post_init__()
-
-        # Set XIELU activation
-        if HAS_XIELU:
-            self.activation_func = XIELU
-            logger.info("Using XIELU activation function for Apertus model")
-        else:
-            raise ImportError(
-                "XIELU activation not found. Please ensure Swiss AI Megatron-LM is in PYTHONPATH:\n"
-                "export PYTHONPATH=/iopsstor/scratch/cscs/xyixuan/Megatron-LM:$PYTHONPATH"
+    def provide(self, pre_process=None, post_process=None, vp_stage=None) -> "MCoreGPTModel":
+        """Build the model, then apply Llama3-style RoPE scaling if configured."""
+        model = super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        if self.scale_factor is not None:
+            model.rotary_pos_emb.inv_freq = apply_rope_scaling(
+                model.rotary_pos_emb.inv_freq,
+                factor=self.scale_factor,
+                low_freq_factor=self.low_freq_factor,
+                high_freq_factor=self.high_freq_factor,
+                old_context_len=self.old_context_len,
             )
-
-        # Set RoPE scaling factor for Llama3-style scaling
-        self.rotary_scaling_factor = self.scale_factor
+        return model
 
 
 @dataclass
 class ApertusModelProvider8B(ApertusModelProvider):
-    """Configuration for Apertus-8B model (swiss-ai/Apertus-8B-2509).
+    """Configuration for the public Apertus-8B model (swiss-ai/Apertus-8B-2509).
 
     Architecture:
-    - 32 layers
-    - 4096 hidden size
+    - 32 layers, 4096 hidden size
     - 32 attention heads, 8 KV heads (GQA)
-    - 21504 FFN hidden size
+    - 21504 FFN hidden size (ungated)
     - 131072 vocab size
-    - 65536 max position embeddings
+    - 65536 max position embeddings (8x llama3 RoPE scaling from 8192)
     - 12M rope_theta
     """
 
@@ -111,4 +119,5 @@ class ApertusModelProvider8B(ApertusModelProvider):
     num_query_groups: int = 8
     ffn_hidden_size: int = 21504
     seq_length: int = 65536
-    rotary_base: float = 12000000.0
+    rotary_base: float = 12_000_000.0
+    scale_factor: Optional[float] = 8.0

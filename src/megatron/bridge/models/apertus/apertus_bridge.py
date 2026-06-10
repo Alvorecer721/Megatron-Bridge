@@ -64,10 +64,13 @@ class ApertusBridge(MegatronModelBridge):
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
         hf_config = hf_pretrained.config
 
-        # Get RoPE scale factor from config
-        scale_factor = 8.0  # default
-        if getattr(hf_config, "rope_scaling", None) is not None:
-            scale_factor = hf_config.rope_scaling.get("factor", 8.0)
+        # Llama3-style RoPE scaling: read the full dict; absent means the
+        # checkpoint uses unscaled RoPE (scale_factor=None -> no scaling).
+        rope_scaling = getattr(hf_config, "rope_scaling", None) or {}
+        scale_factor = rope_scaling.get("factor")
+        low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+        high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
+        old_context_len = rope_scaling.get("original_max_position_embeddings", 8192)
 
         # Extract kv_channels from head_dim if present
         kv_channels = getattr(hf_config, "head_dim", None)
@@ -86,8 +89,11 @@ class ApertusBridge(MegatronModelBridge):
             gated_linear_unit=False,  # Apertus uses XIELU, NOT gated MLP
             # Apertus-specific: QK normalization
             qk_layernorm=getattr(hf_config, "qk_norm", True),
-            # RoPE scaling
+            # RoPE scaling (full llama3 parameterization from HF config)
             scale_factor=scale_factor,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
             make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(hf_config.vocab_size),
             share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
             fp16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16),
