@@ -15,7 +15,7 @@
 """Apertus Model Provider for Swiss AI Apertus models.
 
 Runs on stock megatron-core: XIELU is owned by the bridge
-(megatron.bridge.models.apertus.xielu) and instantiated as a module
+(megatron.bridge.models.apertus.xielu_activation) and instantiated as a module
 activation through the layer spec, and Llama3-style RoPE scaling is
 applied in provide() following the Llama3.1 provider pattern.
 """
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 from megatron.core.transformer.spec_utils import ModuleSpec
 
-from megatron.bridge.models.apertus.xielu import XIELU
+from megatron.bridge.models.apertus.xielu_activation import XIELU
 from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
 from megatron.bridge.models.llama.llama_provider import apply_rope_scaling
 

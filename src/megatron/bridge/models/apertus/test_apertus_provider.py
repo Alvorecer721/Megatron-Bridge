@@ -45,7 +45,7 @@ def eager_ref_fp32(x, raw_ap, raw_an, beta=BETA, eps=EPS):
 
 
 def test_xielu_module():
-    from megatron.bridge.models.apertus.xielu import XIELU
+    from megatron.bridge.models.apertus.xielu_activation import XIELU
 
     m = XIELU(config=None, dtype=torch.bfloat16).cuda()
     params = dict(m.named_parameters())
