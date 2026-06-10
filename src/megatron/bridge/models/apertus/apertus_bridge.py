@@ -64,13 +64,21 @@ class ApertusBridge(MegatronModelBridge):
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
         hf_config = hf_pretrained.config
 
-        # Llama3-style RoPE scaling: read the full dict; absent means the
-        # checkpoint uses unscaled RoPE (scale_factor=None -> no scaling).
-        rope_scaling = getattr(hf_config, "rope_scaling", None) or {}
-        scale_factor = rope_scaling.get("factor")
-        low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
-        high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
-        old_context_len = rope_scaling.get("original_max_position_embeddings", 8192)
+        # Llama3-style RoPE scaling via mcore's native rope_scaling passthrough.
+        # mcore hardcodes low_freq_factor=1.0, high_freq_factor=4.0 and original
+        # context 8192 — validate the HF dict matches before silently using it.
+        rope_dict = getattr(hf_config, "rope_scaling", None) or {}
+        rope_scaling = bool(rope_dict)
+        rope_scaling_factor = rope_dict.get("factor", 1.0)
+        if rope_scaling:
+            fixed = {"low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+            mismatched = {k: rope_dict.get(k, v) for k, v in fixed.items() if rope_dict.get(k, v) != v}
+            if mismatched:
+                raise ValueError(
+                    f"Apertus rope_scaling has non-default llama3 parameters {mismatched}; "
+                    f"mcore's native rope scaling hardcodes {fixed} and would silently "
+                    "build a different model."
+                )
 
         # Extract kv_channels from head_dim if present
         kv_channels = getattr(hf_config, "head_dim", None)
@@ -89,11 +97,9 @@ class ApertusBridge(MegatronModelBridge):
             gated_linear_unit=False,  # Apertus uses XIELU, NOT gated MLP
             # Apertus-specific: QK normalization
             qk_layernorm=getattr(hf_config, "qk_norm", True),
-            # RoPE scaling (full llama3 parameterization from HF config)
-            scale_factor=scale_factor,
-            low_freq_factor=low_freq_factor,
-            high_freq_factor=high_freq_factor,
-            old_context_len=old_context_len,
+            # RoPE scaling (native mcore llama3 passthrough, validated above)
+            rope_scaling=rope_scaling,
+            rope_scaling_factor=rope_scaling_factor,
             make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(hf_config.vocab_size),
             share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
             fp16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16),

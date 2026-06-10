@@ -15,22 +15,20 @@
 """Apertus Model Provider for Swiss AI Apertus models.
 
 Runs on stock megatron-core: XIELU is owned by the bridge
-(megatron.bridge.models.apertus.xielu_activation) and instantiated as a module
-activation through the layer spec, and Llama3-style RoPE scaling is
-applied in provide() following the Llama3.1 provider pattern.
+(megatron.bridge.models.apertus.xielu_activation) and instantiated as a
+module activation through the layer spec. Llama3-style RoPE scaling uses
+the provider's native rope_scaling/rope_scaling_factor passthrough (mcore
+hardcodes low_freq_factor=1.0, high_freq_factor=4.0, original context 8192
+— the bridge validates the HF config matches those assumptions).
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 from megatron.bridge.models.apertus.xielu_activation import XIELU
 from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
-from megatron.bridge.models.llama.llama_provider import apply_rope_scaling
-
-if TYPE_CHECKING:
-    from megatron.core.models.gpt.gpt_model import GPTModel as MCoreGPTModel
 
 
 def apertus_layer_spec(config: "ApertusModelProvider") -> ModuleSpec:
@@ -52,7 +50,7 @@ class ApertusModelProvider(GPTModelProvider):
     Apertus is based on Llama architecture with:
     - XIELU activation (learnable alpha_p, alpha_n; NOT a gated MLP)
     - QK normalization
-    - Llama3-style RoPE scaling, parameterized by the HF ``rope_scaling`` dict
+    - Llama3-style RoPE scaling (native mcore rope_scaling passthrough)
     """
 
     # Core architecture settings (Llama-like but NOT gated MLP)
@@ -71,12 +69,11 @@ class ApertusModelProvider(GPTModelProvider):
     use_te_activation_func: bool = True
     transformer_layer_spec: Union[ModuleSpec, Callable[["GPTModelProvider"], ModuleSpec]] = apertus_layer_spec
 
-    # Llama3-style RoPE scaling, populated from the HF rope_scaling dict.
-    # scale_factor=None means the checkpoint uses no scaling.
-    scale_factor: Optional[float] = None
-    low_freq_factor: float = 1.0
-    high_freq_factor: float = 4.0
-    old_context_len: int = 8192
+    # Llama3-style RoPE scaling: parent GPTModelProvider passes these straight
+    # to mcore RotaryEmbedding. Populated from the HF rope_scaling dict by the
+    # bridge; rope_scaling=False means the checkpoint uses unscaled RoPE.
+    rope_scaling: bool = False
+    rope_scaling_factor: float = 1.0
 
     # Fusions — bias_activation_fusion must stay off for a module activation
     bias_activation_fusion: bool = False
@@ -85,19 +82,6 @@ class ApertusModelProvider(GPTModelProvider):
     bias_dropout_fusion: bool = True
     apply_rope_fusion: bool = True
     use_transformer_engine_op_fuser: Optional[bool] = None
-
-    def provide(self, pre_process=None, post_process=None, vp_stage=None) -> "MCoreGPTModel":
-        """Build the model, then apply Llama3-style RoPE scaling if configured."""
-        model = super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        if self.scale_factor is not None:
-            model.rotary_pos_emb.inv_freq = apply_rope_scaling(
-                model.rotary_pos_emb.inv_freq,
-                factor=self.scale_factor,
-                low_freq_factor=self.low_freq_factor,
-                high_freq_factor=self.high_freq_factor,
-                old_context_len=self.old_context_len,
-            )
-        return model
 
 
 @dataclass
@@ -120,4 +104,5 @@ class ApertusModelProvider8B(ApertusModelProvider):
     ffn_hidden_size: int = 21504
     seq_length: int = 65536
     rotary_base: float = 12_000_000.0
-    scale_factor: Optional[float] = 8.0
+    rope_scaling: bool = True
+    rope_scaling_factor: float = 8.0
