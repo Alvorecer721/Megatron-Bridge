@@ -82,7 +82,9 @@ class XIELU(MegatronModule):
     def _log_once(cls, key: str, msg: str) -> None:
         if key not in cls._logged_paths:
             cls._logged_paths.add(key)
-            logger.info(msg)
+            # eager fallback is a silent performance degradation -> WARNING so
+            # it surfaces even under Ray workers' default log level
+            (logger.warning if key == "eager" else logger.info)(msg)
 
     def _cuda_usable(self, x: torch.Tensor) -> bool:
         return (
