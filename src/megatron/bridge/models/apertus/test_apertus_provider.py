@@ -196,6 +196,26 @@ def test_bridge_parses_full_rope_dict():
     except ValueError as e:
         check("bridge: non-default rope params rejected", True, str(e)[:60])
 
+    # transformers v5 shape: rope_theta + scaling live in rope_parameters,
+    # and the v4 attributes do not exist at all on the config object
+    hf_v5 = fake_hf(None)
+    del hf_v5.config.rope_scaling
+    del hf_v5.config.rope_theta
+    hf_v5.config.rope_parameters = {
+        "rope_type": "llama3",
+        "rope_theta": 4_000_000,
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_max_position_embeddings": 8192,
+    }
+    p_v5 = b.provider_bridge(hf_v5)
+    check(
+        "bridge: transformers-v5 rope_parameters parsed",
+        p_v5.rope_scaling is True and p_v5.rope_scaling_factor == 32.0 and p_v5.rotary_base == 4_000_000,
+        f"rope_scaling={p_v5.rope_scaling} factor={p_v5.rope_scaling_factor} theta={p_v5.rotary_base}",
+    )
+
 
 def main():
     print(f"torch {torch.__version__} | {torch.cuda.get_device_name(0)}")
