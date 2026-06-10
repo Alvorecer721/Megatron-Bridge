@@ -25,6 +25,7 @@ otherwise falls back to a jit-fused eager implementation. Set
 ``APERTUS_EAGER_XIELU=1`` to force the eager path for debugging.
 """
 
+import logging
 import os
 
 import torch
@@ -33,6 +34,8 @@ import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
+
+logger = logging.getLogger(__name__)
 
 try:
     from xielu import xielu as _xielu_cuda
@@ -72,6 +75,15 @@ class XIELU(MegatronModule):
         self.eps = eps
         self._force_eager = os.environ.get("APERTUS_EAGER_XIELU", "0") == "1"
 
+    # class-level so each dispatch path is logged once per process, not per layer
+    _logged_paths: set = set()
+
+    @classmethod
+    def _log_once(cls, key: str, msg: str) -> None:
+        if key not in cls._logged_paths:
+            cls._logged_paths.add(key)
+            logger.info(msg)
+
     def _cuda_usable(self, x: torch.Tensor) -> bool:
         return (
             _xielu_cuda is not None
@@ -82,9 +94,22 @@ class XIELU(MegatronModule):
             and x.numel() % 128 == 0
         )
 
+    def _eager_reason(self, x: torch.Tensor) -> str:
+        if _xielu_cuda is None:
+            return "xielu CUDA extension not installed"
+        if self._force_eager:
+            return "APERTUS_EAGER_XIELU=1"
+        if not x.is_cuda:
+            return "input not on CUDA"
+        if x.dtype != torch.bfloat16 or self.alpha_p.dtype != torch.bfloat16:
+            return f"dtype {x.dtype}/{self.alpha_p.dtype} (kernel is bf16-only)"
+        return f"numel {x.numel()} not divisible by 128"
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._cuda_usable(x):
+            self._log_once("cuda", "Apertus XIELU: using fused CUDA kernel (xielu extension)")
             return _xielu_cuda(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
+        self._log_once("eager", f"Apertus XIELU: using eager fallback ({self._eager_reason(x)})")
         alpha_p = F.softplus(self.alpha_p)
         alpha_n = self.beta + F.softplus(self.alpha_n)
         return compiled_xielu(x, alpha_p, alpha_n, self.beta, self.eps)
