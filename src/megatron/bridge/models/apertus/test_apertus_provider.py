@@ -102,7 +102,7 @@ def _tiny_provider(**overrides):
 
 
 def test_provider_builds_on_stock_mcore():
-    p = _tiny_provider(scale_factor=None)
+    p = _tiny_provider()
     if hasattr(p, "finalize"):
         p.finalize()
     model = p.provide(pre_process=True, post_process=True).cuda()
@@ -125,10 +125,8 @@ def test_provider_builds_on_stock_mcore():
 
 
 def test_rope_scaling_applied():
-    from megatron.bridge.models.llama.llama_provider import apply_rope_scaling
-
-    p0 = _tiny_provider(scale_factor=None)
-    p1 = _tiny_provider(scale_factor=32.0)
+    p0 = _tiny_provider()  # rope_scaling defaults to False
+    p1 = _tiny_provider(rope_scaling=True, rope_scaling_factor=32.0)
     for p in (p0, p1):
         if hasattr(p, "finalize"):
             p.finalize()
@@ -136,14 +134,17 @@ def test_rope_scaling_applied():
     m1 = p1.provide(pre_process=True, post_process=True)
 
     base = m0.rotary_pos_emb.inv_freq
-    expected = apply_rope_scaling(base, factor=32.0, low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192)
     got = m1.rotary_pos_emb.inv_freq
-    unscaled_differs = not torch.equal(base, got)
-    check("scale_factor=None leaves inv_freq unscaled + factor=32 scales it", unscaled_differs)
+    # llama3 scaling only ever reduces frequencies: low-freq components are
+    # divided by the full factor, high-freq are untouched, mid are smoothed.
+    ratio = got / base
+    check("rope_scaling=False leaves inv_freq unscaled", not torch.equal(base, got))
     check(
-        "inv_freq matches apply_rope_scaling(factor=32)",
-        torch.allclose(got, expected),
-        f"max_err={(got - expected).abs().max().item():.3e}",
+        "factor=32 scaling shape (low/32 .. high unchanged)",
+        torch.isclose(ratio.min(), torch.tensor(1.0 / 32.0, device=ratio.device), rtol=1e-4).item()
+        and torch.isclose(ratio.max(), torch.tensor(1.0, device=ratio.device), rtol=1e-6).item()
+        and bool((ratio <= 1.0 + 1e-6).all()),
+        f"ratio range=({ratio.min().item():.5f}, {ratio.max().item():.5f})",
     )
 
 
@@ -178,16 +179,22 @@ def test_bridge_parses_full_rope_dict():
         "rope_type": "llama3",
     }
     p = b.provider_bridge(fake_hf(apertus15))
-    check("bridge: factor=32 parsed", getattr(p, "scale_factor", None) == 32.0, f"got {getattr(p, 'scale_factor', None)}")
     check(
-        "bridge: low/high/old parsed",
-        getattr(p, "low_freq_factor", None) == 1.0
-        and getattr(p, "high_freq_factor", None) == 4.0
-        and getattr(p, "old_context_len", None) == 8192,
+        "bridge: factor=32 parsed",
+        getattr(p, "rope_scaling", None) is True and getattr(p, "rope_scaling_factor", None) == 32.0,
+        f"got rope_scaling={getattr(p, 'rope_scaling', None)} factor={getattr(p, 'rope_scaling_factor', None)}",
     )
 
     p_none = b.provider_bridge(fake_hf(None))
-    check("bridge: rope_scaling=None -> no scaling", getattr(p_none, "scale_factor", "unset") is None)
+    check("bridge: rope_scaling=None -> no scaling", getattr(p_none, "rope_scaling", "unset") is False)
+
+    # non-default llama3 params must be rejected loudly, not silently dropped
+    bad = dict(apertus15, low_freq_factor=2.0)
+    try:
+        b.provider_bridge(fake_hf(bad))
+        check("bridge: non-default rope params rejected", False, "accepted silently")
+    except ValueError as e:
+        check("bridge: non-default rope params rejected", True, str(e)[:60])
 
 
 def main():
