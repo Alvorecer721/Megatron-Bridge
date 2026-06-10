@@ -64,15 +64,32 @@ class ApertusBridge(MegatronModelBridge):
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
         hf_config = hf_pretrained.config
 
-        # Llama3-style RoPE scaling via mcore's native rope_scaling passthrough.
-        # mcore hardcodes low_freq_factor=1.0, high_freq_factor=4.0 and original
-        # context 8192 — validate the HF dict matches before silently using it.
-        rope_dict = getattr(hf_config, "rope_scaling", None) or {}
-        rope_scaling = bool(rope_dict)
-        rope_scaling_factor = rope_dict.get("factor", 1.0)
+        # RoPE config: transformers v5 consolidates rope_theta + rope_scaling
+        # into a single rope_parameters dict; v4-era configs expose separate
+        # attributes. Accept both shapes, never fall back silently.
+        rope_params = dict(getattr(hf_config, "rope_parameters", None) or {})
+        if not rope_params:
+            rope_params = dict(getattr(hf_config, "rope_scaling", None) or {})
+        if "rope_theta" not in rope_params:
+            theta = getattr(hf_config, "rope_theta", None)
+            if theta is None:
+                raise ValueError(
+                    "Could not determine rope_theta from HF config "
+                    "(checked rope_parameters and rope_theta attributes)."
+                )
+            rope_params["rope_theta"] = theta
+        rotary_base = rope_params["rope_theta"]
+
+        rope_type = rope_params.get("rope_type", rope_params.get("type", "default"))
+        if rope_type not in ("default", "llama3"):
+            raise ValueError(f"Unsupported rope_type {rope_type!r} for Apertus (expected default or llama3).")
+        rope_scaling = rope_type == "llama3"
+        rope_scaling_factor = rope_params.get("factor", 1.0)
         if rope_scaling:
+            # mcore's native llama3 scaling hardcodes these — validate the HF
+            # config matches before silently building a different model.
             fixed = {"low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
-            mismatched = {k: rope_dict.get(k, v) for k, v in fixed.items() if rope_dict.get(k, v) != v}
+            mismatched = {k: rope_params.get(k, v) for k, v in fixed.items() if rope_params.get(k, v) != v}
             if mismatched:
                 raise ValueError(
                     f"Apertus rope_scaling has non-default llama3 parameters {mismatched}; "
@@ -92,7 +109,7 @@ class ApertusBridge(MegatronModelBridge):
             layernorm_epsilon=hf_config.rms_norm_eps,
             num_query_groups=hf_config.num_key_value_heads,
             seq_length=hf_config.max_position_embeddings,
-            rotary_base=hf_config.rope_theta,
+            rotary_base=rotary_base,
             kv_channels=kv_channels,
             gated_linear_unit=False,  # Apertus uses XIELU, NOT gated MLP
             # Apertus-specific: QK normalization
