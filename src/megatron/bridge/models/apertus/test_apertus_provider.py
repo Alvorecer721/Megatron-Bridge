@@ -15,25 +15,20 @@
 """Unit tests for Apertus bridge internals: XIELU module, MLP wiring, RoPE scaling.
 
 Requires 1 GPU and stock megatron-core (no Swiss fork). Run standalone:
-    PYTHONPATH=<bridge>/src[:<xielu-site>] python test_apertus_provider.py
-Exit code 0 = all checks pass.
+    PYTHONPATH=<bridge>/src[:<xielu-site>] python test_apertus_provider.py [tokenizer_dir]
+The optional tokenizer_dir argument additionally asserts the tokenizer loads
+and carries a chat template (used by job prologues). Exit code 0 = all pass.
 """
 
-import os
 import sys
 from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
+from _test_harness import check, dist_init, finish
+
 BETA, EPS = 0.5, -1e-6
-failures = []
-
-
-def check(name, cond, detail=""):
-    print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}")
-    if not cond:
-        failures.append(name)
 
 
 def eager_ref_fp32(x, raw_ap, raw_an, beta=BETA, eps=EPS):
@@ -66,18 +61,6 @@ def test_xielu_module():
     )
 
 
-def _dist_init():
-    from megatron.core import parallel_state
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29511")
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group("nccl", world_size=1, rank=0)
-    parallel_state.initialize_model_parallel(1, 1)
-    model_parallel_cuda_manual_seed(42)
-
-
 def _tiny_provider(**overrides):
     from megatron.bridge.models.apertus import ApertusModelProvider
 
@@ -98,14 +81,13 @@ def _tiny_provider(**overrides):
         gradient_accumulation_fusion=False,
     )
     kwargs.update(overrides)
-    return ApertusModelProvider(**kwargs)
+    provider = ApertusModelProvider(**kwargs)
+    provider.finalize()
+    return provider
 
 
 def test_provider_builds_on_stock_mcore():
-    p = _tiny_provider()
-    if hasattr(p, "finalize"):
-        p.finalize()
-    model = p.provide(pre_process=True, post_process=True).cuda()
+    model = _tiny_provider().provide(pre_process=True, post_process=True).cuda()
 
     names = dict(model.named_parameters())
     has_alpha = "decoder.layers.0.mlp.activation_func.alpha_p" in names
@@ -121,17 +103,20 @@ def test_provider_builds_on_stock_mcore():
     out.float().sum().backward()
     ap = names.get("decoder.layers.0.mlp.activation_func.alpha_p")
     check("alpha grads flow through model", ap is not None and ap.grad is not None and ap.grad.abs().sum() > 0)
-    return model
+
+
+def test_fusion_invariant_enforced():
+    # NeMo-RL's megatron_cfg overwrites fusion flags after construction;
+    # finalize() must repair the invalid combination rather than crash later
+    p = _tiny_provider()
+    p.bias_activation_fusion = True
+    p.finalize()
+    check("finalize() forces bias_activation_fusion off", p.bias_activation_fusion is False)
 
 
 def test_rope_scaling_applied():
-    p0 = _tiny_provider()  # rope_scaling defaults to False
-    p1 = _tiny_provider(rope_scaling=True, rope_scaling_factor=32.0)
-    for p in (p0, p1):
-        if hasattr(p, "finalize"):
-            p.finalize()
-    m0 = p0.provide(pre_process=True, post_process=True)
-    m1 = p1.provide(pre_process=True, post_process=True)
+    m0 = _tiny_provider().provide(pre_process=True, post_process=True)
+    m1 = _tiny_provider(rope_scaling=True, rope_scaling_factor=32.0).provide(pre_process=True, post_process=True)
 
     base = m0.rotary_pos_emb.inv_freq
     got = m1.rotary_pos_emb.inv_freq
@@ -217,16 +202,24 @@ def test_bridge_parses_full_rope_dict():
     )
 
 
+def test_tokenizer(tokenizer_dir):
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir)
+    check("tokenizer chat template present", bool(tok.chat_template), f"{len(tok.chat_template or '')} chars")
+
+
 def main():
-    print(f"torch {torch.__version__} | {torch.cuda.get_device_name(0)}")
+    print(f"torch {torch.__version__} | {torch.cuda.get_device_name(0)}", flush=True)
     test_xielu_module()
-    _dist_init()
+    dist_init()
     test_provider_builds_on_stock_mcore()
+    test_fusion_invariant_enforced()
     test_rope_scaling_applied()
     test_bridge_parses_full_rope_dict()
-
-    print(f"\n{len(failures)} failure(s)" if failures else "\nALL APERTUS PROVIDER CHECKS PASSED")
-    sys.exit(1 if failures else 0)
+    if len(sys.argv) > 1:
+        test_tokenizer(sys.argv[1])
+    finish()
 
 
 if __name__ == "__main__":

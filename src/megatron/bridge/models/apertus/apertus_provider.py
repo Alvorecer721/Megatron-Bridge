@@ -22,13 +22,16 @@ hardcodes low_freq_factor=1.0, high_freq_factor=4.0, original context 8192
 — the bridge validates the HF config matches those assumptions).
 """
 
+import logging
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Callable, Union
 
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 from megatron.bridge.models.apertus.xielu_activation import XIELU
 from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
+
+logger = logging.getLogger(__name__)
 
 
 def apertus_layer_spec(config: "ApertusModelProvider") -> ModuleSpec:
@@ -65,23 +68,33 @@ class ApertusModelProvider(GPTModelProvider):
     # Apertus-specific: QK normalization
     qk_layernorm: bool = True
 
-    # XIELU is built from the layer spec as a module activation
+    # XIELU is built from the layer spec as a module activation.
+    # Llama3-style RoPE scaling uses the parent's native rope_scaling /
+    # rope_scaling_factor fields, populated from the HF config by the bridge.
     use_te_activation_func: bool = True
     transformer_layer_spec: Union[ModuleSpec, Callable[["GPTModelProvider"], ModuleSpec]] = apertus_layer_spec
 
-    # Llama3-style RoPE scaling: parent GPTModelProvider passes these straight
-    # to mcore RotaryEmbedding. Populated from the HF rope_scaling dict by the
-    # bridge; rope_scaling=False means the checkpoint uses unscaled RoPE.
-    rope_scaling: bool = False
-    rope_scaling_factor: float = 1.0
-
     # Fusions — bias_activation_fusion must stay off for a module activation
     bias_activation_fusion: bool = False
-    masked_softmax_fusion: bool = True
     persist_layer_norm: bool = True
     bias_dropout_fusion: bool = True
     apply_rope_fusion: bool = True
-    use_transformer_engine_op_fuser: Optional[bool] = None
+
+    def finalize(self) -> None:
+        """Validate the config, enforcing the module-activation fusion invariant.
+
+        Downstream config systems (e.g. NeMo-RL's megatron_cfg) overwrite
+        fusion flags after construction and before finalize();
+        bias_activation_fusion cannot apply to a module activation, so enforce
+        the invariant here instead of relying on every recipe to override it.
+        """
+        if self.use_te_activation_func and self.bias_activation_fusion:
+            logger.warning(
+                "Apertus: forcing bias_activation_fusion=False — the fusion is "
+                "incompatible with the XIELU module activation."
+            )
+            self.bias_activation_fusion = False
+        super().finalize()
 
 
 @dataclass

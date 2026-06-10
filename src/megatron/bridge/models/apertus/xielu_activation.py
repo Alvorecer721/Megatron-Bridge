@@ -44,8 +44,15 @@ except ImportError:
 
 
 @jit_fuser
-def compiled_xielu(x, alpha_p, alpha_n, beta: float, eps: float):
-    """Eager XIELU on post-softplus coefficients (Swiss-fork formula)."""
+def compiled_xielu(x, raw_alpha_p, raw_alpha_n, beta: float, eps: float):
+    """Eager XIELU on raw (pre-softplus) alphas (Swiss-fork formula).
+
+    The softplus reparameterization lives inside the fused region so the
+    scalar ops fold into the elementwise kernel instead of launching
+    separately per call.
+    """
+    alpha_p = F.softplus(raw_alpha_p)
+    alpha_n = beta + F.softplus(raw_alpha_n)
     return torch.where(
         x > 0,
         alpha_p * x * x + beta * x,
@@ -97,6 +104,8 @@ class XIELU(MegatronModule):
         )
 
     def _eager_reason(self, x: torch.Tensor) -> str:
+        # diagnostic mirror of _cuda_usable, evaluated once per process when
+        # the fallback first fires — keep the conditions in sync
         if _xielu_cuda is None:
             return "xielu CUDA extension not installed"
         if self._force_eager:
@@ -111,7 +120,6 @@ class XIELU(MegatronModule):
         if self._cuda_usable(x):
             self._log_once("cuda", "Apertus XIELU: using fused CUDA kernel (xielu extension)")
             return _xielu_cuda(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
-        self._log_once("eager", f"Apertus XIELU: using eager fallback ({self._eager_reason(x)})")
-        alpha_p = F.softplus(self.alpha_p)
-        alpha_n = self.beta + F.softplus(self.alpha_n)
-        return compiled_xielu(x, alpha_p, alpha_n, self.beta, self.eps)
+        if "eager" not in XIELU._logged_paths:  # build the reason string only on first fallback
+            self._log_once("eager", f"Apertus XIELU: using eager fallback ({self._eager_reason(x)})")
+        return compiled_xielu(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
