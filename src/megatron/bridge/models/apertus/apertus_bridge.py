@@ -190,7 +190,12 @@ class ApertusBridge(MegatronModelBridge):
         """
         module = task.megatron_module
         if module is not None and task.global_param_name.endswith("mlp.activation_func.alpha_p"):
-            hf_alpha = next(k for k in converted_weights_dict if k.endswith(".alpha_p"))
+            hf_alpha = next((k for k in converted_weights_dict if k.endswith(".alpha_p")), None)
+            if hf_alpha is None:
+                raise ValueError(
+                    f"Expected an alpha_p HF weight while exporting {task.global_param_name}, "
+                    f"got keys: {sorted(converted_weights_dict)}"
+                )
             hf_prefix = hf_alpha[: -len("alpha_p")]
             alpha = converted_weights_dict[hf_alpha]
             converted_weights_dict[hf_prefix + "beta"] = torch.tensor(
