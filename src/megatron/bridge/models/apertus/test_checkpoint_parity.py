@@ -69,7 +69,11 @@ def megatron_forward(vocab):
 
     dist_init(port=29521)
     bridge = AutoBridge.from_hf_pretrained(CKPT)
-    models = bridge.to_megatron_model(load_weights=True, wrap_with_ddp=False)
+    provider = bridge.to_megatron_provider(load_weights=True)
+    provider.gradient_accumulation_fusion = False
+    if hasattr(provider, "finalize"):
+        provider.finalize()
+    models = provider.provide_distributed_model(wrap_with_ddp=False)
     model = models[0].cuda().eval()
 
     out = {}
