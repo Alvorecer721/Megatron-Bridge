@@ -22,6 +22,7 @@ hardcodes low_freq_factor=1.0, high_freq_factor=4.0, original context 8192
 — the bridge validates the HF config matches those assumptions).
 """
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import Callable, Union
@@ -42,7 +43,11 @@ def apertus_layer_spec(config: "ApertusModelProvider") -> ModuleSpec:
     alpha_p/alpha_n become ``mlp.activation_func.*`` parameters.
     """
     spec = default_layer_spec(config)
-    spec.submodules.mlp.submodules.activation_func = ModuleSpec(module=XIELU)
+    mlp = spec.submodules.mlp
+    if isinstance(mlp, functools.partial):
+        mlp.keywords["submodules"].activation_func = XIELU
+    else:
+        mlp.submodules.activation_func = ModuleSpec(module=XIELU)
     return spec
 
 
