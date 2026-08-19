@@ -27,8 +27,8 @@ Run (1 GPU, ~40GB):
 import argparse
 
 import torch
-
 from _test_harness import check, dist_init, finish
+
 
 SEQ_LENS = [128, 12288]
 
@@ -59,9 +59,7 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("hf_checkpoint", help="HF-format Apertus checkpoint path")
-    parser.add_argument(
-        "raw_iteration", help="Raw Megatron torch_dist iteration directory"
-    )
+    parser.add_argument("raw_iteration", help="Raw Megatron torch_dist iteration directory")
     args = parser.parse_args()
 
     dist_init(port=29531)

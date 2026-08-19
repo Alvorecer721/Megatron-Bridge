@@ -28,8 +28,8 @@ import gc
 import logging
 
 import torch
-
 from _test_harness import check, dist_init, finish
+
 
 logging.basicConfig(level=logging.INFO)  # surface the XIELU dispatch-path log
 
@@ -48,18 +48,14 @@ def make_ids(seq_len, seed):
 def hf_forward(checkpoint):
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(
-        checkpoint, torch_dtype=torch.bfloat16, device_map="cuda"
-    ).eval()
+    model = AutoModelForCausalLM.from_pretrained(checkpoint, torch_dtype=torch.bfloat16, device_map="cuda").eval()
     vocab = model.config.vocab_size
     out = {}
     with torch.no_grad():
         for s in SEQ_LENS:
             ids = make_ids(s, seed=s)
             logits = model(input_ids=ids).logits
-            top2 = logits[0].topk(
-                2, dim=-1
-            )  # bf16 topk: avoids a full-vocab fp32 temporary
+            top2 = logits[0].topk(2, dim=-1)  # bf16 topk: avoids a full-vocab fp32 temporary
             out[s] = (
                 logits[0, -TAIL:].float().cpu(),
                 top2.indices[:, 0].cpu(),
