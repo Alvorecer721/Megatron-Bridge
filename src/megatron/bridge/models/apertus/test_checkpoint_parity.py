@@ -23,9 +23,9 @@ Run:
 Exit code 0 = parity holds.
 """
 
+import argparse
 import gc
 import logging
-import sys
 
 import torch
 
@@ -33,13 +33,6 @@ from _test_harness import check, dist_init, finish
 
 logging.basicConfig(level=logging.INFO)  # surface the XIELU dispatch-path log
 
-CKPT = (
-    sys.argv[1]
-    if len(sys.argv) > 1
-    else (
-        "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
-    )
-)
 SEQ_LENS = [
     128,
     12288,
@@ -52,11 +45,11 @@ def make_ids(seq_len, seed):
     return torch.randint(4, 100_000, (1, seq_len), generator=g).cuda()
 
 
-def hf_forward():
+def hf_forward(checkpoint):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        CKPT, torch_dtype=torch.bfloat16, device_map="cuda"
+        checkpoint, torch_dtype=torch.bfloat16, device_map="cuda"
     ).eval()
     vocab = model.config.vocab_size
     out = {}
@@ -79,11 +72,11 @@ def hf_forward():
     return out, vocab
 
 
-def megatron_forward(vocab):
+def megatron_forward(checkpoint, vocab):
     from megatron.bridge import AutoBridge
 
     dist_init(port=29521)
-    bridge = AutoBridge.from_hf_pretrained(CKPT)
+    bridge = AutoBridge.from_hf_pretrained(checkpoint)
     provider = bridge.to_megatron_provider(load_weights=True)
     provider.gradient_accumulation_fusion = False
     if hasattr(provider, "finalize"):
@@ -106,10 +99,14 @@ def megatron_forward(vocab):
 
 
 def main():
-    print(f"checkpoint: {CKPT}", flush=True)
-    hf, vocab = hf_forward()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("checkpoint", help="HF-format Apertus checkpoint path")
+    args = parser.parse_args()
+
+    print(f"checkpoint: {args.checkpoint}", flush=True)
+    hf, vocab = hf_forward(args.checkpoint)
     print("HF forward done", flush=True)
-    mg = megatron_forward(vocab)
+    mg = megatron_forward(args.checkpoint, vocab)
     print("Megatron forward done", flush=True)
 
     for s in SEQ_LENS:

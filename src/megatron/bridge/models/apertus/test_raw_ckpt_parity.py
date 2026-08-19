@@ -24,27 +24,12 @@ Run (1 GPU, ~40GB):
     PYTHONPATH=<bridge>/src python test_raw_ckpt_parity.py <hf_ckpt> <raw_iter_dir>
 """
 
-import sys
+import argparse
 
 import torch
 
 from _test_harness import check, dist_init, finish
 
-HF_CKPT = (
-    sys.argv[1]
-    if len(sys.argv) > 1
-    else (
-        "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
-    )
-)
-RAW_ITER = (
-    sys.argv[2]
-    if len(sys.argv) > 2
-    else (
-        "/capstor/store/cscs/swissai/infra01/apertus_1p5/Megatron-LM-8B/logs/Meg-Runs/main-runs-v2-apertus-1p5"
-        "/long_context_sft/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n/checkpoints/iter_0004200"
-    )
-)
 SEQ_LENS = [128, 12288]
 
 
@@ -72,8 +57,15 @@ def main():
 
     from megatron.bridge import AutoBridge
 
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("hf_checkpoint", help="HF-format Apertus checkpoint path")
+    parser.add_argument(
+        "raw_iteration", help="Raw Megatron torch_dist iteration directory"
+    )
+    args = parser.parse_args()
+
     dist_init(port=29531)
-    bridge = AutoBridge.from_hf_pretrained(HF_CKPT)
+    bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint)
     provider = bridge.to_megatron_provider(load_weights=True)
     provider.gradient_accumulation_fusion = False  # no apex in this env
     provider.finalize()
@@ -84,7 +76,7 @@ def main():
 
     # overwrite the same skeleton's weights from the raw torch_dist checkpoint
     sharded = model.sharded_state_dict(prefix="")
-    loaded = dist_checkpointing.load(sharded, RAW_ITER)
+    loaded = dist_checkpointing.load(sharded, args.raw_iteration)
     # the load also surfaces the checkpoint's common state (args, optimizer,
     # counters, ...) — keep only what the model actually asked for
     loaded = {k: v for k, v in loaded.items() if k in sharded}
