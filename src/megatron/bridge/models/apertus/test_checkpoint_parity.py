@@ -33,10 +33,17 @@ from _test_harness import check, dist_init, finish
 
 logging.basicConfig(level=logging.INFO)  # surface the XIELU dispatch-path log
 
-CKPT = sys.argv[1] if len(sys.argv) > 1 else (
-    "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
+CKPT = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else (
+        "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
+    )
 )
-SEQ_LENS = [128, 12288]  # 12288 > original_max_position_embeddings=8192 -> scaling active
+SEQ_LENS = [
+    128,
+    12288,
+]  # 12288 > original_max_position_embeddings=8192 -> scaling active
 TAIL = 32  # positions compared exactly; full sequence compared by argmax agreement
 
 
@@ -48,15 +55,23 @@ def make_ids(seq_len, seed):
 def hf_forward():
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(CKPT, torch_dtype=torch.bfloat16, device_map="cuda").eval()
+    model = AutoModelForCausalLM.from_pretrained(
+        CKPT, torch_dtype=torch.bfloat16, device_map="cuda"
+    ).eval()
     vocab = model.config.vocab_size
     out = {}
     with torch.no_grad():
         for s in SEQ_LENS:
             ids = make_ids(s, seed=s)
             logits = model(input_ids=ids).logits
-            top2 = logits[0].topk(2, dim=-1)  # bf16 topk: avoids a full-vocab fp32 temporary
-            out[s] = (logits[0, -TAIL:].float().cpu(), top2.indices[:, 0].cpu(), top2.values.float().cpu())
+            top2 = logits[0].topk(
+                2, dim=-1
+            )  # bf16 topk: avoids a full-vocab fp32 temporary
+            out[s] = (
+                logits[0, -TAIL:].float().cpu(),
+                top2.indices[:, 0].cpu(),
+                top2.values.float().cpu(),
+            )
             del logits, top2
     del model
     gc.collect()

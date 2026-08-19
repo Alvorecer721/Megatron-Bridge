@@ -30,7 +30,10 @@ import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
+from megatron.bridge.models.conversion.model_bridge import (
+    MegatronModelBridge,
+    WeightConversionTask,
+)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     QKVMapping,
@@ -43,7 +46,9 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider
 
 
-@MegatronModelBridge.register_bridge(source="ApertusForCausalLM", target=GPTModel)
+@MegatronModelBridge.register_bridge(
+    source="ApertusForCausalLM", target=GPTModel, model_type="apertus"
+)
 class ApertusBridge(MegatronModelBridge):
     """
     Megatron Bridge for Apertus Causal LM.
@@ -61,7 +66,13 @@ class ApertusBridge(MegatronModelBridge):
         >>> provider = bridge.to_megatron_provider()
     """
 
-    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
+    # Apertus needs a custom provider to install its XIELU layer spec. The
+    # generic builder-backed GPT config cannot represent that wiring yet.
+    MODEL_CONFIG_CLASS = None
+
+    def provider_bridge(
+        self, hf_pretrained: PreTrainedCausalLM
+    ) -> ApertusModelProvider:
         hf_config = hf_pretrained.config
 
         # theta + factor via the shared v4/v5 compat helpers; rope_type and the
@@ -70,17 +81,29 @@ class ApertusBridge(MegatronModelBridge):
         rotary_base = rope_theta_from_hf(hf_config)
         rope_scaling_factor = rope_scaling_factor_from_hf(hf_config, default=1.0)
         rope_dict = (
-            getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
+            getattr(hf_config, "rope_parameters", None)
+            or getattr(hf_config, "rope_scaling", None)
+            or {}
         )
         rope_type = rope_dict.get("rope_type", rope_dict.get("type", "default"))
         if rope_type not in ("default", "llama3"):
-            raise ValueError(f"Unsupported rope_type {rope_type!r} for Apertus (expected default or llama3).")
+            raise ValueError(
+                f"Unsupported rope_type {rope_type!r} for Apertus (expected default or llama3)."
+            )
         rope_scaling = rope_type == "llama3"
         if rope_scaling:
             # mcore's native llama3 scaling hardcodes these — validate the HF
             # config matches before silently building a different model.
-            fixed = {"low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
-            mismatched = {k: rope_dict.get(k, v) for k, v in fixed.items() if rope_dict.get(k, v) != v}
+            fixed = {
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            }
+            mismatched = {
+                k: rope_dict.get(k, v)
+                for k, v in fixed.items()
+                if rope_dict.get(k, v) != v
+            }
             if mismatched:
                 raise ValueError(
                     f"Apertus rope_scaling has non-default llama3 parameters {mismatched}; "
@@ -108,10 +131,18 @@ class ApertusBridge(MegatronModelBridge):
             # RoPE scaling (native mcore llama3 passthrough, validated above)
             rope_scaling=rope_scaling,
             rope_scaling_factor=rope_scaling_factor,
-            make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(hf_config.vocab_size),
-            share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
-            fp16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16),
-            bf16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.bfloat16),
+            make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(
+                hf_config.vocab_size
+            ),
+            share_embeddings_and_output_weights=getattr(
+                hf_config, "tie_word_embeddings", False
+            ),
+            fp16=(
+                self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16
+            ),
+            bf16=(
+                self.dtype_from_hf(hf_config, default=torch.float32) == torch.bfloat16
+            ),
             params_dtype=self.dtype_from_hf(hf_config, default=torch.float32),
             vocab_size=hf_config.vocab_size,
         )
@@ -124,7 +155,7 @@ class ApertusBridge(MegatronModelBridge):
         Apertus uses different layernorm names and XIELU activation (not gated MLP).
         """
         # Register XIELU as replicated module type (learnable but not tensor-parallel)
-        AutoMapping.register_module_type('XIELU', 'replicated')
+        AutoMapping.register_module_type("XIELU", "replicated")
 
         # Apertus HF parameter names are different from standard Llama:
         # - attention_layernorm instead of input_layernorm
@@ -136,24 +167,19 @@ class ApertusBridge(MegatronModelBridge):
             "embedding.word_embeddings.weight": "model.embed_tokens.weight",
             "output_layer.weight": "lm_head.weight",
             "decoder.final_layernorm.weight": "model.norm.weight",
-
             # Layer norms: TE-fused in Megatron (the provider always builds the
             # TE spec); HF uses nonstandard names (attention_layernorm /
             # feedforward_layernorm instead of input/post_attention_layernorm)
             "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.attention_layernorm.weight",
             "decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.feedforward_layernorm.weight",
-
             # Attention output projection
             "decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
-
             # MLP (NOT gated - Apertus uses XIELU activation on up_proj directly)
             "decoder.layers.*.mlp.linear_fc1.weight": "model.layers.*.mlp.up_proj.weight",
             "decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
-
             # QK normalization weights (Apertus-specific)
             "decoder.layers.*.self_attention.q_layernorm.weight": "model.layers.*.self_attn.q_norm.weight",
             "decoder.layers.*.self_attention.k_layernorm.weight": "model.layers.*.self_attn.k_norm.weight",
-
             # XIELU activation parameters (Apertus-specific)
             "decoder.layers.*.mlp.activation_func.alpha_p": "model.layers.*.mlp.act_fn.alpha_p",
             "decoder.layers.*.mlp.activation_func.alpha_n": "model.layers.*.mlp.act_fn.alpha_n",
@@ -161,7 +187,9 @@ class ApertusBridge(MegatronModelBridge):
 
         mapping_list = []
         for megatron_param, hf_param in param_mappings.items():
-            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
+            mapping_list.append(
+                AutoMapping(megatron_param=megatron_param, hf_param=hf_param)
+            )
 
         # Add QKV mapping (combine separate Q, K, V into single QKV matrix)
         mapping_list.append(
@@ -189,7 +217,9 @@ class ApertusBridge(MegatronModelBridge):
         disk-load the HF checkpoint to recover them.
         """
         module = task.megatron_module
-        if module is not None and task.global_param_name.endswith("mlp.activation_func.alpha_p"):
+        if module is not None and task.global_param_name.endswith(
+            "mlp.activation_func.alpha_p"
+        ):
             hf_alpha = next(k for k in converted_weights_dict if k.endswith(".alpha_p"))
             hf_prefix = hf_alpha[: -len("alpha_p")]
             alpha = converted_weights_dict[hf_alpha]

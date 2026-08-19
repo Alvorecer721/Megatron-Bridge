@@ -30,12 +30,20 @@ import torch
 
 from _test_harness import check, dist_init, finish
 
-HF_CKPT = sys.argv[1] if len(sys.argv) > 1 else (
-    "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
+HF_CKPT = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else (
+        "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
+    )
 )
-RAW_ITER = sys.argv[2] if len(sys.argv) > 2 else (
-    "/capstor/store/cscs/swissai/infra01/apertus_1p5/Megatron-LM-8B/logs/Meg-Runs/main-runs-v2-apertus-1p5"
-    "/long_context_sft/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n/checkpoints/iter_0004200"
+RAW_ITER = (
+    sys.argv[2]
+    if len(sys.argv) > 2
+    else (
+        "/capstor/store/cscs/swissai/infra01/apertus_1p5/Megatron-LM-8B/logs/Meg-Runs/main-runs-v2-apertus-1p5"
+        "/long_context_sft/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n/checkpoints/iter_0004200"
+    )
 )
 SEQ_LENS = [128, 12288]
 

@@ -77,7 +77,9 @@ class ApertusModelProvider(GPTModelProvider):
     # Llama3-style RoPE scaling uses the parent's native rope_scaling /
     # rope_scaling_factor fields, populated from the HF config by the bridge.
     use_te_activation_func: bool = True
-    transformer_layer_spec: Union[ModuleSpec, Callable[["GPTModelProvider"], ModuleSpec]] = apertus_layer_spec
+    transformer_layer_spec: Union[
+        ModuleSpec, Callable[["GPTModelProvider"], ModuleSpec]
+    ] = apertus_layer_spec
 
     # Fusions — bias_activation_fusion must stay off for a module activation
     bias_activation_fusion: bool = False

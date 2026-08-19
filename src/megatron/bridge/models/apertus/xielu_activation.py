@@ -68,15 +68,27 @@ class XIELU(MegatronModule):
     both the HF checkpoint layout and the Swiss-fork Megatron param names.
     """
 
-    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6, dtype=None):
+    def __init__(
+        self,
+        config=None,
+        alpha_p_init=0.8,
+        alpha_n_init=0.8,
+        beta=0.5,
+        eps=-1e-6,
+        dtype=None,
+    ):
         super().__init__(config=config)
         if dtype is None:
             dtype = getattr(config, "params_dtype", None) or torch.float32
         self.alpha_p = nn.Parameter(
-            torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=dtype)) - 1.0).unsqueeze(0)
+            torch.log(
+                torch.exp(torch.tensor(alpha_p_init, dtype=dtype)) - 1.0
+            ).unsqueeze(0)
         )
         self.alpha_n = nn.Parameter(
-            torch.log(torch.exp(torch.tensor(alpha_n_init - beta, dtype=dtype)) - 1.0).unsqueeze(0)
+            torch.log(
+                torch.exp(torch.tensor(alpha_n_init - beta, dtype=dtype)) - 1.0
+            ).unsqueeze(0)
         )
         self.beta = beta
         self.eps = eps
@@ -118,8 +130,15 @@ class XIELU(MegatronModule):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._cuda_usable(x):
-            self._log_once("cuda", "Apertus XIELU: using fused CUDA kernel (xielu extension)")
+            self._log_once(
+                "cuda", "Apertus XIELU: using fused CUDA kernel (xielu extension)"
+            )
             return _xielu_cuda(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
-        if "eager" not in XIELU._logged_paths:  # build the reason string only on first fallback
-            self._log_once("eager", f"Apertus XIELU: using eager fallback ({self._eager_reason(x)})")
+        if (
+            "eager" not in XIELU._logged_paths
+        ):  # build the reason string only on first fallback
+            self._log_once(
+                "eager",
+                f"Apertus XIELU: using eager fallback ({self._eager_reason(x)})",
+            )
         return compiled_xielu(x, self.alpha_p, self.alpha_n, self.beta, self.eps)

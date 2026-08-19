@@ -29,7 +29,17 @@ def check(name, cond, detail=""):
 
 
 def finish():
-    print(f"\n{len(failures)} failure(s)" if failures else "\nALL CHECKS PASSED", flush=True)
+    if torch.distributed.is_initialized():
+        from megatron.core import parallel_state
+
+        if parallel_state.is_initialized():
+            parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+    print(
+        f"\n{len(failures)} failure(s)" if failures else "\nALL CHECKS PASSED",
+        flush=True,
+    )
     sys.exit(1 if failures else 0)
 
 
