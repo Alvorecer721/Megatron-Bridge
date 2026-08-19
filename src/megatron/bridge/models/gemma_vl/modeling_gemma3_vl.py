@@ -14,20 +14,28 @@
 
 import types
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
 from transformers import AutoModel, Gemma3Model
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
-from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
+from megatron.bridge.utils.common_utils import (
+    hook_hf_module_setattr_for_tp_grad_sync,
+    slice_batch_for_context_parallel,
+)
 from megatron.bridge.utils.import_utils import safe_import_from
+
+
+if TYPE_CHECKING:
+    from megatron.core.packed_seq_params import PackedSeqParams
 
 
 TENorm, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TENorm")
@@ -83,7 +91,12 @@ class Gemma3VLModel(MegatronModule):
         self.post_process = post_process
         self.vp_stage = vp_stage
         if pre_process:
-            self.vision_tower = AutoModel.from_config(config.vision_config)
+            # Unwrap SiglipVisionModel so vision_tower params stay flat
+            # (vision_tower.embeddings.*), matching HF checkpoint keys.
+            _vc = config.vision_config
+            _vc.vision_use_head = False
+            _raw_vision = AutoModel.from_config(_vc)
+            self.vision_tower = getattr(_raw_vision, "vision_model", _raw_vision)
             self.multi_modal_projector = Gemma3VLMultimodalProjector(config.vision_projector_config)
             # Ensure HF visual tower params are marked for TP grad sync and future assignments are hooked.
             hook_hf_module_setattr_for_tp_grad_sync(self.vision_tower)
@@ -110,12 +123,16 @@ class Gemma3VLModel(MegatronModule):
         pixel_values: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        packed_seq_params: Optional["PackedSeqParams"] = None,
         *,
         loss_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor | None]:
         r"""
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The temporal, height and width of feature shape of each image in LLM.
+        Forward pass combining HuggingFace vision encoder with Megatron language model.
+
+        Returns:
+            tuple: (output_tensor, loss_mask) where output_tensor contains model output
+                   and loss_mask is the CP-sliced mask for consistent loss computation.
         """
         if self.pre_process:
             if inputs_embeds is None:
@@ -126,7 +143,7 @@ class Gemma3VLModel(MegatronModule):
                 inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # [b, decoder_seq_len, h_language]
 
             if pixel_values is not None:
-                image_features = self.get_image_features(pixel_values)
+                image_features = self.get_image_features(pixel_values, return_dict=True).pooler_output
 
                 # TODO might need to check if input_ids is None
                 assert input_ids is not None
@@ -134,7 +151,7 @@ class Gemma3VLModel(MegatronModule):
                 special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
 
                 if inputs_embeds[special_image_mask].numel() != image_features.numel():
-                    image_tokens_in_text = special_image_mask.sum(dim=1).item(dim=0)[0]
+                    image_tokens_in_text = special_image_mask[:, :, 0].sum().item()
                     raise ValueError(
                         f"Number of images does not match number of special image tokens in the input text. "
                         f"Got {image_tokens_in_text} image tokens in the text but {image_features.shape[0] * image_features.shape[1]} "
@@ -144,18 +161,47 @@ class Gemma3VLModel(MegatronModule):
                 inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
             inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # (B, T, D) -> (T, B, D)
 
-        attention_mask = self._compute_attention_mask(input_ids)
+        # Compute the attention bias on the full sequence. The zero/negative
+        # bias expresses causal text attention plus bidirectional image blocks
+        # while keeping Transformer Engine on its fused backend.
+        attention_bias_dtype = inputs_embeds.dtype if inputs_embeds is not None else self.config.params_dtype
+        attention_biases = self._compute_attention_biases(input_ids, dtype=attention_bias_dtype)
+
+        # CP slicing: slice embeddings, labels, loss_mask, and position_ids.
+        # Context parallelism is rejected by the provider while attention bias
+        # slicing is unsupported.
+        # This must happen AFTER vision-text merge so image token positions are correct
+        inputs_embeds, labels, loss_mask, position_ids, _ = slice_batch_for_context_parallel(
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            loss_mask=loss_mask,
+            position_ids=position_ids,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+            pg_collection=self.config._pg_collection,
+        )
+
+        # Apply SP scatter after CP slice, before entering the language model.
+        # The language model's embedding layer (which normally handles SP scatter) is
+        # bypassed when decoder_input is provided. Matches Megatron Core's LLaVA pattern
+        # (llava_model.py:747-750): CP slice first, then SP scatter → [S/(CP*TP), B, H].
+        if self.config.sequence_parallel and inputs_embeds is not None:
+            tp_group = self.config._pg_collection.tp if self.config._pg_collection is not None else None
+            inputs_embeds = scatter_to_sequence_parallel_region(inputs_embeds, group=tp_group)
 
         outputs = self.language_model.forward(
             input_ids=None,
             position_ids=position_ids,
-            attention_mask=attention_mask,  # (B, 1, T, T)
-            decoder_input=inputs_embeds,  # (T, B, D)
-            labels=labels,  # (B, T)
+            attention_mask=None,
+            decoder_input=inputs_embeds,
+            labels=labels,
             loss_mask=loss_mask,
             runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
+            extra_block_kwargs={"attention_bias": attention_biases},
         )
-        return outputs
+        # Return both outputs and the CP-sliced loss_mask for consistent loss computation
+        return (outputs, loss_mask)
 
     def freeze(self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool):
         """Freeze model modules.
@@ -188,14 +234,21 @@ class Gemma3VLModel(MegatronModule):
             for param in module.parameters():
                 param.requires_grad = False
 
-    def _compute_attention_mask(
+    def _compute_attention_biases(
         self,
-        input_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not self.pre_process:
+        input_ids: Optional[torch.Tensor],
+        *,
+        dtype: torch.dtype,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Build local/global additive biases for Gemma 3 VL attention."""
+        if input_ids is None:
             return None
-        batch_size, seq_len = input_ids.shape
-        causal_mask = torch.tril(torch.ones((batch_size, 1, seq_len, seq_len))).to(input_ids.device)
+        _, seq_len = input_ids.shape
+        causal_mask = torch.ones(
+            (1, 1, seq_len, seq_len),
+            dtype=torch.bool,
+            device=input_ids.device,
+        ).tril()
 
         image_mask = input_ids == self.config.image_token_id
         padded_mask = F.pad(image_mask, (1, 0), value=0)
@@ -207,9 +260,17 @@ class Gemma3VLModel(MegatronModule):
             kv_block_indices[:, None, :] == q_block_indices.unsqueeze(-1),
             q_block_indices.unsqueeze(-1) > 0,
         )
-        # See te.DotProductAttention for the requirement of custom mask
-        attention_mask = ~torch.logical_or(causal_mask, bidirectional_mask.unsqueeze(1))
-        return attention_mask
+        global_allowed_mask = torch.logical_or(causal_mask, bidirectional_mask.unsqueeze(1))
+        global_attention_bias = torch.zeros(global_allowed_mask.shape, dtype=dtype, device=input_ids.device)
+        global_attention_bias.masked_fill_(~global_allowed_mask, torch.finfo(dtype).min)
+
+        window_size = self.config.window_size - 1
+        positions = torch.arange(seq_len, device=input_ids.device)
+        local_window_mask = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs() <= window_size
+        local_allowed_mask = torch.logical_and(global_allowed_mask, local_window_mask.view(1, 1, seq_len, seq_len))
+        local_attention_bias = torch.zeros_like(global_attention_bias)
+        local_attention_bias.masked_fill_(~local_allowed_mask, torch.finfo(dtype).min)
+        return local_attention_bias, global_attention_bias
 
 
 @dataclass

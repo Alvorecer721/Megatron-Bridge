@@ -20,12 +20,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from transformers import GenerationConfig
 
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
-from megatron.bridge.models.qwen.qwen_provider import Qwen3MoEModelProvider
 
 
 class TestQwen3MoEBridge:
@@ -58,6 +57,7 @@ class TestQwen3MoEBridge:
             "num_experts": 128,
             "num_experts_per_tok": 8,
             "moe_intermediate_size": 768,
+            "norm_topk_prob": True,
         }
 
     @pytest.fixture
@@ -87,12 +87,17 @@ class TestQwen3MoEBridge:
             "num_experts": 128,
             "num_experts_per_tok": 8,
             "moe_intermediate_size": 1536,
+            "norm_topk_prob": True,
         }
 
     @pytest.fixture
     def mock_qwen3_moe_config(self, qwen3_moe_30b_config_dict):
-        """Create a mock Qwen3 MoE configuration."""
-        config = Mock()
+        """Create a mock Qwen3 MoE configuration.
+
+        Uses spec=list to make getattr return None for undefined attributes
+        instead of Mock objects, which would incorrectly be passed to GPTModelProvider.
+        """
+        config = Mock(spec=[])
         for key, value in qwen3_moe_30b_config_dict.items():
             setattr(config, key, value)
         return config
@@ -102,7 +107,6 @@ class TestQwen3MoEBridge:
         """Create a mock PreTrainedCausalLM with Qwen3 MoE model."""
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_moe_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
         mock_pretrained.model = Mock()
         mock_pretrained.model.dtype = torch.bfloat16
         return mock_pretrained
@@ -120,8 +124,8 @@ class TestQwen3MoEBridge:
         # Call provider_bridge
         result = bridge.provider_bridge(mock_pretrained_qwen3_moe)
 
-        # Check that it returns a Qwen3MoEModelProvider instance
-        assert isinstance(result, Qwen3MoEModelProvider)
+        # Check that it returns a GPTModelProvider instance (after refactoring)
+        assert isinstance(result, GPTModelProvider)
 
         # Check basic configuration mapping
         assert result.num_layers == mock_qwen3_moe_config.num_hidden_layers
@@ -173,6 +177,25 @@ class TestQwen3MoEBridge:
         assert result.moe_router_topk == mock_qwen3_moe_config.num_experts_per_tok
         assert result.moe_grouped_gemm is True
 
+    @pytest.mark.parametrize(
+        ("norm_topk_prob", "moe_router_pre_softmax"),
+        ((True, False), (False, True)),
+    )
+    def test_norm_topk_prob_roundtrip(
+        self,
+        mock_pretrained_qwen3_moe,
+        norm_topk_prob,
+        moe_router_pre_softmax,
+    ):
+        """Test that HF top-k normalization maps symmetrically to Megatron routing."""
+        mock_pretrained_qwen3_moe.config.norm_topk_prob = norm_topk_prob
+
+        provider = Qwen3MoEBridge().provider_bridge(mock_pretrained_qwen3_moe)
+        hf_config = Qwen3MoEBridge.megatron_to_hf_config(provider)
+
+        assert provider.moe_router_pre_softmax is moe_router_pre_softmax
+        assert hf_config["norm_topk_prob"] is norm_topk_prob
+
     def test_provider_bridge_normalization(self, mock_pretrained_qwen3_moe, mock_qwen3_moe_config):
         """Test normalization configuration."""
         bridge = Qwen3MoEBridge()
@@ -196,14 +219,13 @@ class TestQwen3MoEBridge:
     def test_provider_bridge_dtype_handling(self, qwen3_moe_30b_config_dict):
         """Test dtype handling in provider_bridge."""
         # Test with bfloat16
-        config = Mock()
+        config = Mock(spec=[])
         for key, value in qwen3_moe_30b_config_dict.items():
             setattr(config, key, value)
         config.torch_dtype = "bfloat16"
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3MoEBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -220,22 +242,12 @@ class TestQwen3MoEBridge:
         assert result.bf16 is False
         assert result.params_dtype == torch.float16
 
-    def test_provider_bridge_generation_config(self, mock_pretrained_qwen3_moe):
-        """Test generation config mapping."""
-        bridge = Qwen3MoEBridge()
-
-        result = bridge.provider_bridge(mock_pretrained_qwen3_moe)
-
-        # Check that generation config is passed through
-        assert result.generation_config == mock_pretrained_qwen3_moe.generation_config
-
     def test_provider_bridge_tie_word_embeddings_true(self, mock_qwen3_moe_config):
         """Test provider_bridge with tie_word_embeddings=True."""
         mock_qwen3_moe_config.tie_word_embeddings = True
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_moe_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3MoEBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -248,7 +260,6 @@ class TestQwen3MoEBridge:
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_moe_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3MoEBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -263,23 +274,21 @@ class TestQwen3MoEBridge:
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_moe_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3MoEBridge()
         result = bridge.provider_bridge(mock_pretrained)
 
-        # Should default to False when missing
-        assert result.share_embeddings_and_output_weights is False
+        # GPTModelProvider defaults share_embeddings_and_output_weights to True
+        assert result.share_embeddings_and_output_weights is True
 
     def test_provider_bridge_235b_config(self, qwen3_moe_235b_config_dict):
         """Test provider_bridge with Qwen3 MoE 235B configuration."""
-        config = Mock()
+        config = Mock(spec=[])
         for key, value in qwen3_moe_235b_config_dict.items():
             setattr(config, key, value)
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3MoEBridge()
         result = bridge.provider_bridge(mock_pretrained)

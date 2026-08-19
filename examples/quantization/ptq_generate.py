@@ -18,7 +18,8 @@ and perform text generation using the AutoBridge on multiple GPUs.
 
 Prerequisites:
 First, you must run the quantization process to create a quantized checkpoint:
-    torchrun --nproc_per_node 2 examples/quantization/quantize.py --megatron-save-path ./quantized_megatron_checkpoint --tp 2
+    torchrun --nproc_per_node 2 examples/quantization/quantize.py \
+        --hf-model-id meta-llama/Llama-3.2-1B --megatron-save-path ./quantized_megatron_checkpoint --tp 2
 
 The process is as follows:
 1. An AutoBridge is initialized from a pretrained Hugging Face model
@@ -27,28 +28,31 @@ The process is as follows:
 3. Text generation is performed using the loaded quantized model.
 
 Usage:
-torchrun --nproc_per_node 2 examples/quantization/ptq_generate.py --megatron-load-path ./quantized_megatron_checkpoint --tp 2
+torchrun --nproc_per_node 2 examples/quantization/ptq_generate.py --hf-model-id meta-llama/Llama-3.2-1B \
+    --megatron-load-path ./quantized_megatron_checkpoint --tp 2
 """
 
 import argparse
-import os
-import sys
 import warnings
 
+import modelopt.torch.utils.distributed as dist
 import torch
 from megatron.core.utils import unwrap_model
 from quantize import _custom_prompt_forward_loop_func
-from rich.console import Console
+from quantize_utils import (
+    add_common_model_args,
+    build_bridge_and_provider,
+    console,
+    load_quantized_megatron_model,
+    print_parallelism_summary,
+    require_checkpoint,
+    require_torchrun,
+)
 
-from megatron.bridge import AutoBridge
 from megatron.bridge.models.decorators import torchrun_main
-from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 
 
 warnings.filterwarnings("ignore")
-
-HF_MODEL_ID = "meta-llama/Llama-3.2-1B"
-console = Console()
 
 
 def _validate_quantized_model(model: torch.nn.Module, is_rank_0: bool) -> None:
@@ -58,8 +62,9 @@ def _validate_quantized_model(model: torch.nn.Module, is_rank_0: bool) -> None:
     If someone accidentally breaks the quantization loading logic (e.g., in
     has_modelopt_state or build_and_load_model), this check will catch it.
 
-    We check for QuantRowParallelLinear and QuantColumnParallelLinear as these
-    are present in all quantized model architectures (GPT, Llama, Qwen, Nemotron-H, etc).
+    We check for quantized layer types that indicate successful quantization:
+    - Local spec: QuantRowParallelLinear, QuantColumnParallelLinear
+    - TE spec: QuantTERowParallelLinear, QuantTELayerNormColumnParallelLinear
 
     Args:
         model: The unwrapped model to validate
@@ -68,25 +73,36 @@ def _validate_quantized_model(model: torch.nn.Module, is_rank_0: bool) -> None:
     Raises:
         RuntimeError: If the model doesn't contain expected quantized layers
     """
-    # Check for quantized layer types that are universal across all architectures
     model_str = str(model)
 
-    required_quant_layers = [
+    # Local spec quantized layers
+    local_spec_layers = [
         "QuantRowParallelLinear",
         "QuantColumnParallelLinear",
     ]
 
-    missing_layers = [layer for layer in required_quant_layers if layer not in model_str]
+    # TE spec quantized layers
+    te_spec_layers = [
+        "QuantTERowParallelLinear",
+        "QuantTELayerNormColumnParallelLinear",
+    ]
 
-    if missing_layers:
+    # Check if model has local spec quantized layers
+    has_local_spec = all(layer in model_str for layer in local_spec_layers)
+
+    # Check if model has TE spec quantized layers
+    has_te_spec = all(layer in model_str for layer in te_spec_layers)
+
+    if not has_local_spec and not has_te_spec:
         error_msg = (
             f"\n{'=' * 80}\n"
             f"QUANTIZATION VALIDATION FAILED!\n"
             f"{'=' * 80}\n"
             f"Expected quantized layers not found in the loaded model.\n"
             f"This indicates the quantized checkpoint was not loaded correctly.\n\n"
-            f"Missing: {missing_layers}\n"
-            f"Expected: {required_quant_layers}\n\n"
+            f"Expected one of:\n"
+            f"  - Local spec: {local_spec_layers}\n"
+            f"  - TE spec: {te_spec_layers}\n\n"
             f"This is likely due to a bug in the checkpoint loading logic.\n"
             f"{'=' * 80}\n"
         )
@@ -95,14 +111,21 @@ def _validate_quantized_model(model: torch.nn.Module, is_rank_0: bool) -> None:
         raise RuntimeError(error_msg)
 
     if is_rank_0:
-        console.print(
-            "[green]✓ Quantization validation passed: Found QuantRowParallelLinear and QuantColumnParallelLinear[/green]"
-        )
+        if has_te_spec:
+            console.print(
+                "[green]✓ Quantization validation passed: Found TE spec quantized layers "
+                "(QuantTERowParallelLinear, QuantTELayerNormColumnParallelLinear)[/green]"
+            )
+        else:
+            console.print(
+                "[green]✓ Quantization validation passed: Found local spec quantized layers "
+                "(QuantRowParallelLinear, QuantColumnParallelLinear)[/green]"
+            )
 
 
 @torchrun_main
 def main(
-    hf_model_id: str = HF_MODEL_ID,
+    hf_model_id: str,
     tp: int = 1,
     pp: int = 1,
     ep: int = 1,
@@ -113,65 +136,38 @@ def main(
     trust_remote_code: bool | None = None,
 ) -> None:
     """Load a quantized Megatron-LM checkpoint and perform text generation on multiple GPUs."""
-    if os.environ.get("WORLD_SIZE") is None:
-        console.print("This script must be launched with torchrun. Please run:")
-        console.print(f"torchrun --nproc_per_node <gpus> {sys.argv[0]}")
-        sys.exit(1)
-
-    # Check if the checkpoint path exists
-    if not os.path.exists(megatron_load_path):
-        console.print(f"[red]Error: Quantized checkpoint path {megatron_load_path} does not exist![/red]")
-        console.print("[yellow]Please run the quantization process first:[/yellow]")
-        console.print(
-            f"[yellow]torchrun --nproc_per_node {tp} examples/models/quantize.py --megatron-save-path {megatron_load_path} --tp {tp}[/yellow]"
-        )
-        sys.exit(1)
-
-    # Initialize bridge from HF model to get tokenizer and model structure
-    bridge = AutoBridge.from_hf_pretrained(
-        hf_model_id,
-        trust_remote_code=is_safe_repo(
-            trust_remote_code=trust_remote_code,
-            hf_path=hf_model_id,
+    require_torchrun()
+    require_checkpoint(
+        megatron_load_path,
+        quantize_command=(
+            f"torchrun --nproc_per_node {tp} examples/quantization/quantize.py "
+            f"--hf-model-id {hf_model_id} --megatron-save-path {megatron_load_path} --tp {tp}"
         ),
     )
 
-    # Get model provider and configure for multi-GPU execution
-    model_provider = bridge.to_megatron_provider(load_weights=False)
-    model_provider.tensor_model_parallel_size = tp
-    model_provider.pipeline_model_parallel_size = pp
-    model_provider.expert_model_parallel_size = ep
-    model_provider.expert_tensor_parallel_size = etp
-    model_provider.pipeline_dtype = torch.bfloat16
-
-    # Once all overrides are set, finalize the model provider to ensure the post initialization logic is run
-    model_provider.finalize()
-    model_provider.initialize_model_parallel(seed=0)
-    megatron_model = bridge.load_megatron_model(
-        megatron_load_path,
-        mp_overrides={
-            "tensor_model_parallel_size": tp,
-            "pipeline_model_parallel_size": pp,
-            "expert_model_parallel_size": ep,
-            "expert_tensor_parallel_size": etp,
-        },
-        wrap_with_ddp=False,
+    # Initialize bridge from HF model to get tokenizer and model structure
+    bridge, model_provider = build_bridge_and_provider(
+        hf_model_id,
+        tp=tp,
+        pp=pp,
+        ep=ep,
+        etp=etp,
+        load_weights=False,
+        pipeline_dtype=torch.bfloat16,
+        trust_remote_code=trust_remote_code,
     )
+    megatron_model = load_quantized_megatron_model(bridge, megatron_load_path, tp=tp, pp=pp, ep=ep, etp=etp)
     megatron_model = [m.cuda() for m in megatron_model]
 
     # Now we can check for rank
-    is_rank_0 = torch.distributed.get_rank() == 0
+    is_rank_0 = dist.is_master()
 
+    print_parallelism_summary(model_provider)
     if is_rank_0:
-        console.print(f"[green]Tensor parallel size: {model_provider.tensor_model_parallel_size}[/green]")
-        console.print(f"[green]Pipeline parallel size: {model_provider.pipeline_model_parallel_size}[/green]")
-        console.print(f"[green]Expert parallel size: {model_provider.expert_model_parallel_size}[/green]")
-        console.print(f"[green]Expert tensor parallel size: {model_provider.expert_tensor_parallel_size}[/green]")
         console.print(f"[green]Loaded quantized model from: {megatron_load_path}[/green]")
 
     # Get the unwrapped model for generation
     unwrapped_model = unwrap_model(megatron_model)[0]
-    unwrapped_model.eval()
 
     # Validate that the model has quantized layers
     _validate_quantized_model(unwrapped_model, is_rank_0)
@@ -191,14 +187,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Load a quantized Megatron-LM checkpoint and perform text generation on multiple GPUs"
     )
-    parser.add_argument(
-        "--hf-model-id", type=str, default=HF_MODEL_ID, help="HuggingFace model ID for tokenizer and model structure"
-    )
+    add_common_model_args(parser)
 
-    parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism size")
-    parser.add_argument("--pp", type=int, default=1, help="Pipeline parallelism size")
-    parser.add_argument("--ep", type=int, default=1, help="Expert parallelism size")
-    parser.add_argument("--etp", type=int, default=1, help="Expert tensor parallelism size")
     parser.add_argument(
         "--megatron-load-path",
         type=str,
@@ -217,7 +207,6 @@ if __name__ == "__main__":
         default=32,
         help="Output sequence length for generation.",
     )
-    parser.add_argument("--trust-remote-code", action="store_true", help="if trust_remote_code")
 
     args = parser.parse_args()
     main(
@@ -232,5 +221,4 @@ if __name__ == "__main__":
         args.trust_remote_code,
     )
 
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    dist.cleanup()

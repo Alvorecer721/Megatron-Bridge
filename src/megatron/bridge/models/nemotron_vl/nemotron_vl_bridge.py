@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
+from megatron.core.activations import squared_relu
 
 from megatron.bridge.models import ColumnParallelMapping, RowParallelMapping
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
@@ -24,40 +24,94 @@ from megatron.bridge.models.conversion.param_mapping import (
     MambaInProjMapping,
     QKVMapping,
 )
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.nemotron_vl.modeling_nemotron_vl import NemotronVLModel
-from megatron.bridge.models.nemotron_vl.nemotron_vl_provider import NemotronNano12Bv2VLModelProvider
+from megatron.bridge.models.nemotron_vl.nemotron_vl_provider import NemotronVLModelProvider
 
 
-@MegatronModelBridge.register_bridge(source="NemotronH_Nano_VL_V2", target=NemotronVLModel)
+def _is_legacy_v2_omni_config(hf_config) -> bool:
+    """Identify Nano Omni checkpoints serialized with the historical V2 label."""
+
+    architectures = getattr(hf_config, "architectures", None) or []
+    llm_config = getattr(hf_config, "llm_config", None)
+    return (
+        "NemotronH_Nano_VL_V2" in architectures
+        and llm_config is not None
+        and getattr(llm_config, "n_routed_experts", None) is not None
+    )
+
+
+@MegatronModelBridge.register_bridge(
+    source="NemotronH_Nano_VL_V2",
+    target=NemotronVLModel,
+    provider=NemotronVLModelProvider,
+    model_type="nemotron_vl",
+)
 class NemotronVLBridge(MegatronModelBridge):
     """Conversion utilities between HF Nemotron-VL and Megatron-Core format."""
+
+    # Extend CONFIG_MAPPING with Nemotron-VL specific fields
+    CONFIG_MAPPING = MegatronModelBridge.CONFIG_MAPPING + [
+        # Mamba-specific fields
+        ("hybrid_override_pattern", "hybrid_layer_pattern"),
+    ]
 
     # ------------------------------------------------------------------
     # Provider translation
     # ------------------------------------------------------------------
 
-    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> NemotronNano12Bv2VLModelProvider:  # type: ignore[override]
-        hf_config = hf_pretrained.config
+    def _canonical_omni_bridge(self):
+        """Create the canonical bridge lazily to avoid a module import cycle."""
 
-        provider = NemotronNano12Bv2VLModelProvider(
-            num_layers=hf_config.llm_config.num_hidden_layers,
-            hidden_size=hf_config.llm_config.hidden_size,
-            ffn_hidden_size=hf_config.llm_config.intermediate_size,
-            num_attention_heads=hf_config.llm_config.num_attention_heads,
-            num_query_groups=getattr(
-                hf_config.llm_config, "num_key_value_heads", hf_config.llm_config.num_attention_heads // 2
-            ),
-            init_method_std=hf_config.llm_config.initializer_range,
-            layernorm_epsilon=getattr(hf_config.llm_config, "layer_norm_epsilon", 1e-5),
-            make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(hf_config.llm_config.vocab_size),
-            share_embeddings_and_output_weights=getattr(hf_config.llm_config, "tie_word_embeddings", False),
-            vocab_size=hf_config.llm_config.vocab_size,
-            seq_length=hf_config.llm_config.max_position_embeddings,
-            fp16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16),
-            bf16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.bfloat16),
-            params_dtype=self.dtype_from_hf(hf_config, default=torch.float32),
-        )
+        from megatron.bridge.models.nemotron_omni.nemotron_omni_bridge import NemotronOmniBridge
+
+        bridge = NemotronOmniBridge()
+        bridge.hf_pretrained = getattr(self, "hf_pretrained", None)
+        bridge.hf_config = getattr(self, "hf_config", None)
+        return bridge
+
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM):  # type: ignore[override]
+        hf_config = hf_pretrained.config
+        llm_config = hf_config.llm_config
+
+        if _is_legacy_v2_omni_config(hf_config):
+            # Some Nano Omni checkpoints were exported before the dedicated
+            # architecture name existed. Route only the MoE-shaped V2 configs
+            # to the canonical expanded-sequence model; dense V2 checkpoints
+            # continue to use the historical NemotronVLModel/LLaVAModel path.
+            bridge = self._canonical_omni_bridge()
+            bridge.hf_pretrained = hf_pretrained
+            bridge.hf_config = hf_config
+            provider = bridge.provider_bridge(hf_pretrained)
+
+            # The historical tokenizer uses <img>/<\/img> IDs 19/20, whereas
+            # the public V3 checkpoint uses 21/22. Prefer serialized numeric
+            # values when present and otherwise preserve the V2 contract.
+            provider.img_start_token_id = getattr(hf_config, "img_start_token_id", None) or 19
+            provider.img_end_token_id = getattr(hf_config, "img_end_token_id", None) or 20
+            return provider
+
+        # Use base class helper for common config mapping
+        provider_kwargs = self.hf_config_to_provider_kwargs(llm_config)
+
+        # Remove num_layers from provider as it is derived from hybrid_layer_pattern
+        provider_kwargs["num_layers"] = None
+
+        # Handle vocab size divisibility
+        provider_kwargs["make_vocab_size_divisible_by"] = self.make_vocab_size_divisible_by(llm_config.vocab_size)
+
+        provider = NemotronVLModelProvider(**provider_kwargs)
+
+        # Nemotron VL-specific settings
+        # Note: Most defaults come from the provider class hierarchy (NemotronVLModelProvider)
+        provider.scatter_embedding_sequence_parallel = False
+        provider.attention_softmax_in_fp32 = True
+
+        # Override fields that should use NemotronH provider's specialized defaults
+        # instead of HF config values
+        provider.activation_func = squared_relu  # Nemotron uses squared_relu, not HF's hidden_act
+        provider.autocast_dtype = None  # Not set in original code
+
         return provider
 
     # ------------------------------------------------------------------
@@ -65,6 +119,13 @@ class NemotronVLBridge(MegatronModelBridge):
     # ------------------------------------------------------------------
 
     def mapping_registry(self) -> MegatronMappingRegistry:  # noqa: D401
+        if _is_legacy_v2_omni_config(getattr(self, "hf_config", None)):
+            return self._canonical_omni_bridge().mapping_registry()
+        return self._legacy_mapping_registry()
+
+    def _legacy_mapping_registry(self) -> MegatronMappingRegistry:
+        """Return the historical wrapper-prefixed Nemotron-VL mappings."""
+
         param_mappings = {
             # vision model
             "llava_model.vision_model.class_token": "vision_model.radio_model.model.patch_generator.cls_token.token",
@@ -130,12 +191,17 @@ class NemotronVLBridge(MegatronModelBridge):
                 ),
             ]
         )
-        for conv1d_sub_module in ["weight", "bias"]:
+        for megatron_conv1d_param, hf_conv1d_param in [
+            ("conv1d_weight", "conv1d.weight"),
+            ("conv1d_bias", "conv1d.bias"),
+            ("conv1d.weight", "conv1d.weight"),
+            ("conv1d.bias", "conv1d.bias"),
+        ]:
             mapping_list.extend(
                 [
                     MambaConv1dMapping(
-                        megatron_param=rf"llava_model.language_model.decoder.layers.*.mixer.conv1d.{conv1d_sub_module}",
-                        hf_param=rf"language_model.backbone.layers.*.mixer.conv1d.{conv1d_sub_module}",
+                        megatron_param=rf"llava_model.language_model.decoder.layers.*.mixer.{megatron_conv1d_param}",
+                        hf_param=rf"language_model.backbone.layers.*.mixer.{hf_conv1d_param}",
                     ),
                 ]
             )

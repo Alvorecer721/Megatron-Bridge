@@ -13,20 +13,23 @@
 # limitations under the License.
 """Unit tests for megatron.bridge.training.post_training.checkpointing module."""
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.strategies.common import COMMON_STATE_FNAME
 
 from megatron.bridge.training.post_training.checkpointing import (
     _get_modelopt_checkpoint_path,
-    _has_only_kd_state,
+    _validate_modelopt_checkpointing,
     has_modelopt_state,
     load_modelopt_state,
 )
+from megatron.bridge.training.state import TrainState
 
 
 @pytest.fixture
@@ -36,6 +39,36 @@ def mock_model_fixtures():
     mock_model_instance.sharded_state_dict.return_value = {"weight": torch.randn(10, 10), "bias": torch.randn(10)}
     mock_model_instance.load_state_dict.return_value = None
     return [mock_model_instance]
+
+
+def _write_modelopt_common_state(modelopt_state_dir: Path, states, modelopt_version: str | None = None):
+    """Helper to write a common_state file with the given modelopt states."""
+    with open(modelopt_state_dir / "metadata.json", "w") as metadata_file:
+        json.dump({"sharded_backend": "torch_dist", "sharded_backend_version": 1}, metadata_file)
+    modelopt_state = {"modelopt_state_dict": states}
+    if modelopt_version is not None:
+        modelopt_state["modelopt_version"] = modelopt_version
+    common_state_file = modelopt_state_dir / COMMON_STATE_FNAME
+    torch.save(modelopt_state, common_state_file)
+    return common_state_file
+
+
+@pytest.fixture
+def single_rank_process_group(tmp_path):
+    """Initialize a single-rank process group for real distributed-checkpoint saves."""
+    initialized_here = not torch.distributed.is_initialized()
+    if initialized_here:
+        torch.distributed.init_process_group(
+            "gloo",
+            init_method=(tmp_path / "process_group_init").as_uri(),
+            rank=0,
+            world_size=1,
+        )
+
+    yield
+
+    if initialized_here:
+        torch.distributed.destroy_process_group()
 
 
 class TestGetModeloptCheckpointPath:
@@ -111,6 +144,36 @@ class TestGetModeloptCheckpointPath:
                 result = _get_modelopt_checkpoint_path(str(checkpoint_path))
                 assert result == str(iter_folder_200)
                 assert mock_load.call_count == 3
+
+    def test_returns_tracked_iter_folder_before_higher_iter(self):
+        """Test that ModelOpt state follows the checkpoint selected by the native tracker."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir)
+            iter_folder_100 = checkpoint_path / "iter_0000100"
+            iter_folder_200 = checkpoint_path / "iter_0000200"
+            iter_folder_100.mkdir()
+            iter_folder_200.mkdir()
+            (checkpoint_path / "latest_checkpointed_iteration.txt").write_text("100", encoding="utf-8")
+
+            with patch("megatron.core.dist_checkpointing.load_common_state_dict") as mock_load:
+                mock_load.side_effect = lambda path: {"iteration": 100 if path == str(iter_folder_100) else 200}
+
+                result = _get_modelopt_checkpoint_path(str(checkpoint_path))
+
+            assert result == str(iter_folder_100)
+
+    def test_explicit_step_overrides_higher_iter(self):
+        """Test that ModelOpt state follows the explicit native checkpoint step."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir)
+            iter_folder_100 = checkpoint_path / "iter_0000100"
+            iter_folder_200 = checkpoint_path / "iter_0000200"
+            iter_folder_100.mkdir()
+            iter_folder_200.mkdir()
+
+            result = _get_modelopt_checkpoint_path(str(checkpoint_path), ckpt_step=100)
+
+            assert result == str(iter_folder_100)
 
     def test_handles_exception_during_state_dict_load(self):
         """Test that it skips checkpoints that fail to load and continues."""
@@ -268,6 +331,19 @@ class TestGetModeloptCheckpointPath:
 class TestPostTrainingCheckpointUtilities:
     """Test utility functions for post-training checkpoint management."""
 
+    @pytest.mark.parametrize("non_persistent_ckpt_type", ["global", "local"])
+    def test_rejects_non_persistent_modelopt_restore(self, non_persistent_ckpt_type):
+        """Test that ModelOpt restoration rejects ambiguous non-persistent checkpoint loading."""
+        with pytest.raises(
+            ValueError,
+            match="ModelOpt checkpoint restoration is not supported with non-persistent checkpoint loading",
+        ):
+            _validate_modelopt_checkpointing(non_persistent_ckpt_type)
+
+    def test_allows_persistent_modelopt_restore(self):
+        """Test that persistent ModelOpt restoration remains supported."""
+        _validate_modelopt_checkpointing(None)
+
     @pytest.mark.parametrize(
         "checkpoint_path,modelopt_exists,expected",
         [
@@ -284,6 +360,8 @@ class TestPostTrainingCheckpointUtilities:
                 modelopt_state_path = checkpoint_dir / "modelopt_state"
                 modelopt_state_path.mkdir()
 
+                _write_modelopt_common_state(modelopt_state_path, [("quantization", {"value": 1})])
+
                 result = has_modelopt_state(str(checkpoint_dir))
                 assert result == expected
         else:
@@ -298,6 +376,61 @@ class TestPostTrainingCheckpointUtilities:
                     result = has_modelopt_state(str(checkpoint_dir))
                     assert result == expected
 
+    @patch("megatron.bridge.training.post_training.checkpointing._load_extra_state_from_sharded_checkpoint")
+    @patch("megatron.bridge.training.post_training.checkpointing.mto.restore_from_modelopt_state")
+    @patch("megatron.bridge.training.post_training.checkpointing.mto.ModeloptStateManager.is_converted")
+    @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
+    def test_current_torch_dist_save_detect_restore_contract(
+        self,
+        mock_unwrap_model,
+        mock_is_converted,
+        mock_restore_from_state,
+        mock_load_extra_state,
+        mock_model_fixtures,
+        tmp_path,
+        single_rank_process_group,
+    ):
+        """Detect and route restoration for ModelOpt state saved in the current MCore layout."""
+        checkpoint_path = tmp_path / "checkpoint"
+        iteration_path = checkpoint_path / "iter_0000100"
+        newer_iteration_path = checkpoint_path / "iter_0000200"
+        modelopt_state_path = iteration_path / "modelopt_state"
+        iteration_path.mkdir(parents=True)
+        newer_iteration_path.mkdir()
+        torch.save(TrainState(step=100).state_dict(), checkpoint_path / "latest_train_state.pt")
+
+        # The torch_dist strategy synchronizes CUDA even though this fixture only stores objects.
+        with patch("torch.cuda.synchronize"), patch("torch.cuda.current_device", return_value=torch.device("cpu")):
+            dist_checkpointing.save({"iteration": 100}, str(iteration_path), ("torch_dist", 1))
+            modelopt_state_path.mkdir()
+            dist_checkpointing.save(
+                {
+                    "modelopt_version": "0.44.0rc5",
+                    "modelopt_state_dict": [("quantization", {"value": 1})],
+                },
+                str(modelopt_state_path),
+                ("torch_dist", 1),
+            )
+
+        assert not (modelopt_state_path / COMMON_STATE_FNAME).exists()
+        assert not (newer_iteration_path / "modelopt_state").exists()
+        assert has_modelopt_state(str(checkpoint_path)) is True
+
+        original_model = Mock()
+        restored_model = Mock()
+        unwrapped_model = [original_model]
+        mock_unwrap_model.return_value = unwrapped_model
+        mock_is_converted.return_value = False
+        mock_restore_from_state.return_value = restored_model
+        load_modelopt_state(mock_model_fixtures, str(checkpoint_path))
+
+        mock_unwrap_model.assert_called_once_with(mock_model_fixtures)
+        mock_restore_from_state.assert_called_once()
+        assert mock_restore_from_state.call_args.args[0] is original_model
+        assert mock_restore_from_state.call_args.args[1]["modelopt_state_dict"] == [("quantization", {"value": 1})]
+        assert unwrapped_model == [restored_model]
+        mock_load_extra_state.assert_called_once_with(restored_model, str(iteration_path), prefix="")
+
     def test_has_modelopt_state_file_instead_of_dir(self):
         """Test when modelopt_state exists but is a file, not a directory."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -309,10 +442,12 @@ class TestPostTrainingCheckpointUtilities:
             result = has_modelopt_state(str(checkpoint_path))
             assert result is False
 
+    @patch("megatron.bridge.training.post_training.checkpointing.dist_checkpointing.load_common_state_dict")
     @patch("megatron.bridge.training.post_training.checkpointing.os.path.isdir")
-    def test_has_modelopt_state_with_mock(self, mock_isdir):
-        """Test has_modelopt_state with mocked os.path.isdir."""
+    def test_has_modelopt_state_with_mock(self, mock_isdir, mock_load_common_state):
+        """Test has_modelopt_state with a mocked distributed-checkpoint loader."""
         mock_isdir.return_value = True
+        mock_load_common_state.return_value = {"modelopt_state_dict": [("quantization", {"foo": "bar"})]}
 
         result = has_modelopt_state("/fake/checkpoint/path")
         assert result is True
@@ -322,6 +457,7 @@ class TestPostTrainingCheckpointUtilities:
         assert mock_isdir.call_count == 2
         mock_isdir.assert_any_call("/fake/checkpoint/path")
         mock_isdir.assert_any_call("/fake/checkpoint/path/modelopt_state")
+        mock_load_common_state.assert_called_once_with("/fake/checkpoint/path/modelopt_state")
 
     def test_has_modelopt_state_with_none_path(self):
         """Test has_modelopt_state with None checkpoint path."""
@@ -333,85 +469,37 @@ class TestPostTrainingCheckpointUtilities:
         result = has_modelopt_state("")
         assert result is False
 
-    def test_has_only_kd_state_returns_true(self):
-        """Test _has_only_kd_state when modelopt_state contains only kd_loss state."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            modelopt_state_path = Path(temp_dir)
-            common_state_file = modelopt_state_path / COMMON_STATE_FNAME
-
-            # Create modelopt_state_dict with only kd_loss
-            modelopt_state = {"modelopt_state_dict": [("kd_loss", {"some": "data"})]}
-            torch.save(modelopt_state, common_state_file)
-
-            result = _has_only_kd_state(str(modelopt_state_path))
-            assert result is True
-
-    def test_has_only_kd_state_returns_false_multiple_states(self):
-        """Test _has_only_kd_state when modelopt_state contains multiple states."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            modelopt_state_path = Path(temp_dir)
-            common_state_file = modelopt_state_path / COMMON_STATE_FNAME
-
-            # Create modelopt_state_dict with multiple states including kd_loss
-            modelopt_state = {
-                "modelopt_state_dict": [
-                    ("kd_loss", {"some": "data"}),
-                    ("quantization", {"other": "data"}),
-                ]
-            }
-            torch.save(modelopt_state, common_state_file)
-
-            result = _has_only_kd_state(str(modelopt_state_path))
-            assert result is False
-
-    def test_has_only_kd_state_returns_false_different_state(self):
-        """Test _has_only_kd_state when modelopt_state contains a single state that is not kd_loss."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            modelopt_state_path = Path(temp_dir)
-            common_state_file = modelopt_state_path / COMMON_STATE_FNAME
-
-            # Create modelopt_state_dict with only quantization state (not kd_loss)
-            modelopt_state = {"modelopt_state_dict": [("quantization", {"some": "data"})]}
-            torch.save(modelopt_state, common_state_file)
-
-            result = _has_only_kd_state(str(modelopt_state_path))
-            assert result is False
-
-    def test_has_modelopt_state_with_ignore_kd_state_true_only_kd(self):
-        """Test has_modelopt_state with ignore_kd_state=True when only kd_loss state exists."""
+    def test_has_modelopt_state_returns_false_for_only_kd_loss(self):
+        """Test has_modelopt_state ignores a sole kd_loss entry."""
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = Path(temp_dir)
             modelopt_state_path = checkpoint_path / "modelopt_state"
             modelopt_state_path.mkdir()
-            common_state_file = modelopt_state_path / COMMON_STATE_FNAME
 
-            # Create modelopt_state_dict with only kd_loss
-            modelopt_state = {"modelopt_state_dict": [("kd_loss", {"some": "data"})]}
-            torch.save(modelopt_state, common_state_file)
+            _write_modelopt_common_state(
+                modelopt_state_path,
+                [("kd_loss", {"some": "data"})],
+            )
 
-            # When ignore_kd_state=True and only kd_loss exists, should return False
-            result = has_modelopt_state(str(checkpoint_path), ignore_kd_state=True)
+            result = has_modelopt_state(str(checkpoint_path))
             assert result is False
 
-    def test_has_modelopt_state_with_ignore_kd_state_true_multiple_states(self):
-        """Test has_modelopt_state with ignore_kd_state=True when multiple states exist."""
+    def test_has_modelopt_state_returns_true_with_other_states(self):
+        """Test has_modelopt_state stays true when kd_loss is accompanied by other modes."""
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = Path(temp_dir)
             modelopt_state_path = checkpoint_path / "modelopt_state"
             modelopt_state_path.mkdir()
-            common_state_file = modelopt_state_path / COMMON_STATE_FNAME
 
-            # Create modelopt_state_dict with multiple states
-            modelopt_state = {
-                "modelopt_state_dict": [
+            _write_modelopt_common_state(
+                modelopt_state_path,
+                [
                     ("kd_loss", {"some": "data"}),
                     ("quantization", {"other": "data"}),
-                ]
-            }
-            torch.save(modelopt_state, common_state_file)
+                ],
+            )
 
-            # When ignore_kd_state=True and multiple states exist, should return True
-            result = has_modelopt_state(str(checkpoint_path), ignore_kd_state=True)
+            result = has_modelopt_state(str(checkpoint_path))
             assert result is True
 
     def test_has_modelopt_state_with_iter_folders(self):
@@ -422,10 +510,15 @@ class TestPostTrainingCheckpointUtilities:
             iter_folder.mkdir()
             modelopt_state_path = iter_folder / "modelopt_state"
             modelopt_state_path.mkdir()
+            _write_modelopt_common_state(modelopt_state_path, [("quantization", {"value": 1})])
 
             # Mock the dist_checkpointing.load_common_state_dict
             with patch("megatron.core.dist_checkpointing.load_common_state_dict") as mock_load:
-                mock_load.return_value = {"iteration": 100}
+                mock_load.side_effect = lambda path: (
+                    {"modelopt_state_dict": [("quantization", {"value": 1})]}
+                    if str(path).endswith("modelopt_state")
+                    else {"iteration": 100}
+                )
 
                 result = has_modelopt_state(str(checkpoint_path))
                 assert result is True
@@ -458,11 +551,14 @@ class TestPostTrainingCheckpointUtilities:
             # Only create modelopt_state in the iter_200 folder (the latest)
             modelopt_state_path = iter_folder_200 / "modelopt_state"
             modelopt_state_path.mkdir()
+            _write_modelopt_common_state(modelopt_state_path, [("quantization", {"value": 2})])
 
             # Mock the dist_checkpointing.load_common_state_dict
             with patch("megatron.core.dist_checkpointing.load_common_state_dict") as mock_load:
 
                 def load_side_effect(path):
+                    if str(path).endswith("modelopt_state"):
+                        return {"modelopt_state_dict": [("quantization", {"value": 2})]}
                     if "iter_0000100" in path:
                         return {"iteration": 100}
                     elif "iter_0000200" in path:
@@ -477,6 +573,44 @@ class TestPostTrainingCheckpointUtilities:
 
 class TestLoadModeloptState:
     """Test load_modelopt_state function."""
+
+    @patch("megatron.bridge.training.post_training.checkpointing._load_extra_state_from_sharded_checkpoint")
+    @patch("megatron.bridge.training.post_training.checkpointing.mto.restore_from_modelopt_state")
+    @patch("megatron.bridge.training.post_training.checkpointing.mto.ModeloptStateManager.is_converted")
+    @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
+    def test_legacy_common_save_detect_restore_contract(
+        self,
+        mock_unwrap_model,
+        mock_is_converted,
+        mock_restore_from_state,
+        mock_load_extra_state,
+        mock_model_fixtures,
+        tmp_path,
+    ):
+        """Detect and restore ModelOpt state saved in the legacy common.pt layout."""
+        checkpoint_path = tmp_path / "checkpoint"
+        modelopt_state_path = checkpoint_path / "modelopt_state"
+        modelopt_state_path.mkdir(parents=True)
+        _write_modelopt_common_state(
+            modelopt_state_path,
+            [("quantization", {"value": 1})],
+            modelopt_version="0.44.0rc5",
+        )
+
+        assert has_modelopt_state(str(checkpoint_path)) is True
+
+        original_model = Mock()
+        restored_model = Mock()
+        unwrapped_model = [original_model]
+        mock_unwrap_model.return_value = unwrapped_model
+        mock_is_converted.return_value = False
+        mock_restore_from_state.return_value = restored_model
+        load_modelopt_state(mock_model_fixtures, str(checkpoint_path))
+
+        assert mock_restore_from_state.call_args.args[0] is original_model
+        assert mock_restore_from_state.call_args.args[1]["modelopt_state_dict"] == [("quantization", {"value": 1})]
+        assert unwrapped_model == [restored_model]
+        mock_load_extra_state.assert_called_once_with(restored_model, str(checkpoint_path), prefix="")
 
     @patch("megatron.bridge.training.post_training.checkpointing.restore_sharded_modelopt_state")
     @patch("megatron.bridge.training.post_training.checkpointing.unwrap_model")
@@ -608,6 +742,7 @@ class TestPostTrainingIntegration:
             checkpoint_path = Path(temp_dir)
             modelopt_state_path = checkpoint_path / "modelopt_state"
             modelopt_state_path.mkdir()
+            _write_modelopt_common_state(modelopt_state_path, [("quantization", {"value": 4})])
 
             # Check that modelopt_state exists
             assert has_modelopt_state(str(checkpoint_path)) is True

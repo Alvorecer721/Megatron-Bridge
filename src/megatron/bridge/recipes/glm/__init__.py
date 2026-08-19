@@ -12,17 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .gb200.glm5 import (
+    glm52_peft_192gpu_gb200_bf16_config,
+    glm52_pretrain_192gpu_gb200_bf16_config,
+    glm52_sft_192gpu_gb200_bf16_128k_config,
+    glm52_sft_192gpu_gb200_bf16_config,
+)
 from .glm45 import (
-    glm45_355b_finetune_config,
+    glm45_355b_peft_config,
     glm45_355b_pretrain_config,
-    glm45_air_106b_finetune_config,
+    glm45_355b_sft_config,
+    glm45_air_106b_peft_config,
     glm45_air_106b_pretrain_config,
+    glm45_air_106b_sft_config,
 )
 
 
 __all__ = [
     "glm45_355b_pretrain_config",
     "glm45_air_106b_pretrain_config",
-    "glm45_355b_finetune_config",
-    "glm45_air_106b_finetune_config",
+    "glm45_355b_sft_config",
+    "glm45_air_106b_sft_config",
+    "glm45_355b_peft_config",
+    "glm45_air_106b_peft_config",
+    "glm52_peft_192gpu_gb200_bf16_config",
+    "glm52_pretrain_192gpu_gb200_bf16_config",
+    "glm52_sft_192gpu_gb200_bf16_128k_config",
+    "glm52_sft_192gpu_gb200_bf16_config",
 ]

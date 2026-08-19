@@ -1,183 +1,194 @@
 # Packed Sequences
 
-This guide explains how to use packed sequences in Megatron Bridge for efficient supervised fine-tuning (SFT) and parameter-efficient fine-tuning (PEFT).
+Packed sequences are a fine-tuning technique that reduces padding waste by
+concatenating multiple examples into one pack while preserving sequence
+boundaries for attention. In Megatron Bridge, this is primarily a supervised
+fine-tuning and PEFT optimization rather than a general pretraining feature.
 
-## Overview
+This page is the stable overview for what packed sequences are, when to use
+them, and which constraints are durable. For operational setup, code anchors,
+and verification commands, see [skills/nemo-mbridge-perf-sequence-packing/SKILL.md](../skills/nemo-mbridge-perf-sequence-packing/SKILL.md).
 
-When fine-tuning large language models, GPU under-utilization often occurs due to inefficient input data structure. This inefficiency arises because many fine-tuning datasets have a skewed distribution of sequence lengths, with many short sequences and a few long ones, following [Zipf's Law](https://en.wikipedia.org/wiki/Zipf%27s_law). Since transformer models require fixed-length inputs, shorter sequences must be padded with many padding tokens.
+## What It Is
 
-This leads to two main inefficiencies:
+Fine-tuning datasets often contain examples with highly variable lengths. When
+those examples are batched conventionally, many tokens in each batch are just
+padding. Packed sequences reduce that waste by building longer packs from
+multiple examples and carrying boundary metadata into the attention path.
 
-- Computation performed on the pad tokens is eventually masked out, resulting in wasted GPU computation.
-- Micro batch size is often limited by the batch which contains longer sequences, so that most other micro batches have under-utilized GPU memory.
+In Bridge today, there are three distinct packing paths plus long-context
+enablement through context parallelism:
 
-Packed sequences is a training technique where multiple training sequences (examples) are concatenated into one long sequence (pack). This technique greatly reduces the number of padding tokens, allowing more meaningful tokens to be processed in each micro batch. As a result, it maximizes both GPU compute and GPU memory utilization.
+| Path | Use case | Key config |
+|---|---|---|
+| Offline packed SFT | Text-only finetuning | `enable_offline_packing=True` plus `offline_packing_specs` |
+| Direct-HF/VLM in-batch packing | Direct Hugging Face and supported VLM finetuning | `enable_in_batch_packing=True` |
+| Energon online packing | Qwen-VL data using the model-owned Energon collator | `packing_buffer_size=<candidate samples per worker>` |
+| Long-context (CP) | Pretrain / finetune at 16K-128K+ | `context_parallel_size > 1` |
 
-**Note:** Sequence packing is primarily beneficial for fine-tuning workloads. Megatron-style pretraining datasets (using `IndexedDataset` and `GPTDataset`) already concatenate documents during sampling to fill sequences to the target length, eliminating padding tokens without requiring the boundary-aware packing infrastructure described here. For supervised fine-tuning, however, naive concatenation is insufficient—each training example must be treated individually to preserve data quality.
+These are related but they are not the same knob. Offline packed SFT and
+Direct-HF/VLM in-batch packing solve padding waste; long-context training
+primarily addresses activation memory and communication tradeoffs at larger
+sequence lengths.
 
-The conventional solution is to build a custom attention mask (specifically, a block triangular mask) to mask out attention values between sequences. However, this increases the complexity of attention from $\sum_i {s_i}^2$ to $\Big({\sum_i {s_i}}\Big)^2$, where $s_i$ is the length of the $i$th subsequence. In practice, the conventional solution puts a limit on the packed sequence size.
+The shared implementation lives under `megatron.bridge.data.packing`: offline
+GPT SFT materialization, packed Parquet runtime datasets, bin-packing
+algorithms, and collate-time THD packing each have separate modules. Energon
+online packing uses the task encoder's native `select_samples_to_pack` and
+`pack_selected_samples` API while reusing the same canonical THD batch builder. Ordinary
+non-packed padding remains in `megatron.bridge.data.collators`. Use
+`scripts/training/prepare_gpt_sft_packed_data.py` when packed GPT SFT artifacts
+should be prepared before launching training.
 
-Instead, Megatron Bridge provides a highly optimized version of sequence packing which makes use of variable-length attention kernels in FlashAttention and TransformerEngine. Instead of providing a custom attention mask, information about sequence boundaries is passed in with the `cu_seqlens` variable (short for cumulative sequence length). With this approach, attention values between sequences are never calculated, so the complexity of attention remains at $\sum_i {s_i}^2$. This allows the packed sequence size to increase to arbitrary lengths without affecting the memory complexity, so that GPU memory can be fully utilized.
+## When to Use It
 
-The packed sequence implementation automatically creates {py:class}`bridge.data.datasets.sft.GPTSFTPackedDataset` instances when `.npy` files are detected, providing optimized data loading and batching for packed sequences.
+Packed sequences are a good fit when all of the following are true:
 
-## Using Packed Sequences
+- you are doing SFT, PEFT, or supported VLM finetuning using one of the three
+  packing paths above
+- your examples have variable lengths and padding waste is significant
+- you can tolerate the micro-batch constraints of packed training
 
-### Prepare the Dataset
+Packed sequences are usually not the right answer when:
 
-In Megatron Bridge, the packed dataset is automatically prepared before training using the {py:func}`bridge.data.datasets.packed_sequence.prepare_packed_sequence_data` function, eliminating the need for any additional preprocessing steps.
+- you are doing standard Megatron-style pretraining, which already concatenates
+  documents during sampling
+- you want long-context training in general, where context parallelism is often
+  the main technique
+- your model family or recipe explicitly opts out of packed-sequence support
 
-### Configure Packed Sequences
+## Choosing the Offline Pack Length
 
-Packed sequences are configured through the {py:class}`bridge.training.config.FinetuningDatasetConfig` by specifying `packed_sequence_specs`:
+For text-only LLM SFT and PEFT, use 8192 as the first offline-pack target when
+the model context limit, memory, and recipe support allow it. Compare candidate
+lengths at the same token slots per optimizer step:
 
-```python
-from megatron.bridge.training.config import ConfigContainer, FinetuningDatasetConfig
-from megatron.bridge.data.datasets.packed_sequence import PackedSequenceSpecs
-
-config = ConfigContainer(
-    # ... other configurations
-    dataset=FinetuningDatasetConfig(
-        dataset_root="/path/to/your/dataset",
-        seq_length=2048,
-        packed_sequence_specs=PackedSequenceSpecs(
-            packed_sequence_size=2048,
-            tokenizer_model_name="your_tokenizer_name",
-        ),
-    ),
-    # ... other configurations
-)
+```text
+token_slots_per_step = packed_sequence_size * global_batch_size
 ```
 
-### PackedSequenceSpecs Configuration
+Thus 2K/GBS32, 4K/GBS16, and 8K/GBS8 each retain 65,536 token slots per step.
+A longer pack can contain more source examples in the physical MBS1 row and
+reduce gradient accumulation and launch overhead. It also consumes more
+activation memory and can encounter fixed-width kernel constraints, so measure
+the candidates rather than treating 8K as unconditional.
 
-The {py:class}`bridge.data.datasets.packed_sequence.PackedSequenceSpecs` class provides the following configuration options:
+Offline packing requires MBS1. The selected GBS must be divisible by and no
+smaller than data parallel size; an 8K/GBS8 run therefore requires DP no
+larger than 8. Keep model, dataset, and packed sequence lengths equal, write
+changed packing configurations to a fresh output root, and verify the resolved
+post-setup configuration. Changing pack length can alter truncation and pack
+membership even when token slots stay constant, so rerun loss and stability
+checks before replacing existing verification evidence.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `packed_sequence_size` | `int` | `-1` | If positive, enables sequence packing with the specified pack size. If ≤ 0, sequence packing is disabled. |
-| `tokenizer_model_name` | `str` | `None` | Tokenizer model name for tracking, since different tokenizers produce different packed datasets. |
-| `packed_train_data_path` | `str` | `None` | Custom path for packed training dataset file (`.npy` format). |
-| `packed_val_data_path` | `str` | `None` | Custom path for packed validation dataset file (`.npy` format). |
-| `packed_metadata_path` | `str` | `None` | Custom path for packing metadata file (`.jsonl` format). |
-| `pad_cu_seqlens` | `bool` | `False` | Whether to pad `cu_seqlens` to constant size, required for CUDA graphs. |
+Derive the internal sequence alignment from the resolved topology for both SFT
+and PEFT:
 
-### Batch Size Considerations
-
-When using packed sequences, you must adjust your batch sizes:
-
-1. **Micro batch size must be set to 1**: This constraint arises because samples in a micro batch are no longer stacked; they are now concatenated during the data preparation step. Consequently, micro batch size becomes irrelevant when using packed sequences.
-
-2. **Global batch size must be adjusted**: Since each pack now contains multiple sequences, the global batch size needs to be reduced by the average number of sequences per pack `n` where `n = num_sequences_in_dataset / num_packs` (equivalently, `n = packed_sequence_size / average_seq_len`). This ensures that each gradient iteration sees, on average, the same number of tokens. The value of `n` is printed out during the data preparation step. You may need to run training once, obtain the value of `n` from the logs, then run your training script again with the updated global batch size.
-
-### Full Configuration Example
-
-```python
-from megatron.bridge.training.config import (
-    ConfigContainer, TrainingConfig, CheckpointConfig, SchedulerConfig
-)
-from megatron.bridge.training.config import FinetuningDatasetConfig
-from megatron.bridge.data.datasets.packed_sequence import PackedSequenceSpecs
-from megatron.bridge.peft.lora import LoRA
-from megatron.core.optimizer import OptimizerConfig
-
-config = ConfigContainer(
-    model=model_provider,
-    train=TrainingConfig(
-        train_iters=1000,
-        global_batch_size=32,  # Reduced from original due to packing
-        micro_batch_size=1,    # Required for packed sequences
-        eval_interval=100,
-    ),
-    optimizer=OptimizerConfig(
-        optimizer="adam",
-        lr=1e-4,
-        weight_decay=0.01,
-        bf16=True,
-        use_distributed_optimizer=True,
-    ),
-    scheduler=SchedulerConfig(
-        lr_decay_style="cosine",
-        lr_warmup_iters=100,
-        lr_decay_iters=1000,
-    ),
-    dataset=FinetuningDatasetConfig(
-        dataset_root="/path/to/dataset",
-        seq_length=2048,
-        packed_sequence_specs=PackedSequenceSpecs(
-            packed_sequence_size=2048,
-            tokenizer_model_name="llama2_tokenizer",
-        ),
-    ),
-    checkpoint=CheckpointConfig(
-        pretrained_checkpoint="/path/to/pretrained/model",
-        save="/path/to/checkpoints",
-        save_interval=200,
-    ),
-    peft=LoRA(
-        target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
-        dim=16,
-        alpha=32,
-        dropout=0.1,
-    ),
-    # ... other configurations
-)
+```text
+cp_multiple = 2 * CP if CP > 1 else 1
+sp_multiple = CP * TP if sequence parallelism is enabled and TP > 1 else 1
+pad_seq_to_mult = lcm(cp_multiple, sp_multiple)
 ```
 
-## File Organization
+For example, TP1/CP1 with SP disabled uses 1, while TP4/CP1 with SP enabled
+uses 4. The difference comes from execution topology, not from whether the
+trainable set is full SFT or PEFT. Pin the derived value explicitly and rebuild
+the packed output after changing topology because the alignment changes pack
+membership.
 
-When using packed sequences, the {py:class}`bridge.data.builders.finetuning_dataset.FinetuningDatasetBuilder` automatically organizes files in your dataset directory:
+Keep this internal alignment separate from fixed final pack width.
+`pad_to_max_length=true` is needed when a dispatcher or kernel requires a
+static width, such as a HybridEP combine kernel with a fixed token chunk, or
+when using CUDA graphs. CUDA graphs additionally require
+`pad_cu_seqlens=true` and packing metadata. Ordinary eager offline packing
+does not universally require fixed-width padding.
 
-```
-dataset_root/
-├── training.jsonl          # Original training data
-├── validation.jsonl        # Original validation data
-└── packed/
-    └── {tokenizer_name}/
-        ├── training_{packed_size}.npy      # Packed training data
-        ├── validation_{packed_size}.npy    # Packed validation data
-        └── {packed_size}_metadata.jsonl    # Packing metadata
-```
+## Stable Constraints
 
-The tokenizer name and packed sequence size are automatically incorporated into the file paths to avoid conflicts when using different configurations.
+The durable constraints for packed sequences in Bridge are:
 
-## Advanced Configuration
+- offline packed SFT requires configured `micro_batch_size == 1`
+- Direct-HF/VLM in-batch packing requires configured `micro_batch_size > 1`;
+  collation flattens those input rows into one physical THD batch row
+- Energon online packing currently supports the eager Qwen-VL collator path,
+  requires physical `micro_batch_size == 1`, the generic `vlm_step`, per-token loss, and
+  `ddp.average_in_collective=False`
+- standard eager `alltoall` expert parallelism has functional coverage for
+  Qwen3.6-35B-A3B at TP1/PP1/EP8 with EP communication overlap disabled; this
+  is not a performance claim; other EP dispatchers are accepted with fixed-width
+  native packs but do not yet have equivalent runtime evidence; THD boundaries
+  produce a padding mask that excludes fixed-width gaps from MoE auxiliary-loss,
+  z-loss, and expert-bias statistics
+- current MCore may still dispatch those padded positions; expert-capacity/token-
+  dropping configurations do not yet have native-packing runtime coverage
+- `packing_buffer_size` counts candidate samples independently in every Energon
+  worker; it is not a byte cache or a packed-sequence length
+- Energon native packing and collator-owned `enable_in_batch_packing=True` are
+  mutually exclusive
+- Energon native packing does not currently support MTP, CUDA graphs, Qwen3-VL
+  DistTrain, or pipeline parallelism; requested MoE expert-parallel communication
+  overlap is disabled with a warning so training uses the non-overlapped path
+- when context parallelism is used, sequence length must satisfy the standard
+  CP divisibility constraints
+- Direct-HF sequence length must also satisfy the LCM of the training and
+  evaluation CP constraints and `CP * TP` when sequence parallelism is enabled
+- for fine-tuning with CP enabled, per-token loss behavior and reduction
+  settings matter
+- Megatron Bridge automatically enables safe uneven-input padding for eager
+  HybridEP configs; this pads only to the group-wide aligned maximum before
+  dispatch and trims the padding after combine
+- CUDA-graph-friendly packed metadata requires additional padding constraints
 
-### Custom File Paths
+Model-family support is not universal. Some families and recipe paths explicitly
+opt out of packed sequences or related packing modes.
 
-You can specify custom paths for packed data files:
+HybridEP CUDA-graph configs preserve their explicit uneven-input setting because
+the safety path performs a host scalar synchronization that is not capture-safe.
+They must provide equal per-rank dispatch shapes. Disable CUDA graphs when packed
+runtime token counts can differ so Bridge can enable safe padding.
 
-```python
-packed_sequence_specs = PackedSequenceSpecs(
-    packed_sequence_size=4096,
-    tokenizer_model_name="custom_tokenizer",
-    packed_train_data_path="/custom/path/training_packed.npy",
-    packed_val_data_path="/custom/path/validation_packed.npy",
-    packed_metadata_path="/custom/path/metadata.jsonl",
-)
-```
+## Relationship to Long-Sequence Training
 
-### CUDA Graphs Support
+Packed sequences and long-sequence training are often mentioned together because
+both affect sequence layout and memory behavior, but they solve different
+problems:
 
-For CUDA graphs compatibility, enable `pad_cu_seqlens`:
+- packed sequences mainly reduce padding waste in fine-tuning datasets
+- long-sequence training mainly addresses activation memory and communication
+  tradeoffs at larger sequence lengths
 
-```python
-packed_sequence_specs = PackedSequenceSpecs(
-    packed_sequence_size=2048,
-    pad_cu_seqlens=True,  # Required for CUDA graphs
-    tokenizer_model_name="your_tokenizer",
-)
-```
+For long-sequence training guidance, see:
 
-When `pad_cu_seqlens=True`, you must also set `pad_to_max_length=True` in your dataset configuration.
+- `docs/performance-guide.md`
+- `docs/training/hierarchical-context-parallel.md`
 
-## API Reference
+## Practical Caveats
 
-For detailed API documentation, see:
+The most stable caveats to remember are:
 
-- {py:class}`bridge.training.config.FinetuningDatasetConfig` - Main dataset configuration class
-- {py:class}`bridge.data.datasets.packed_sequence.PackedSequenceSpecs` - Packed sequence configuration
-- {py:func}`bridge.data.datasets.packed_sequence.prepare_packed_sequence_data` - Data preparation function
-- {py:class}`bridge.data.datasets.sft.GPTSFTPackedDataset` - Packed sequence dataset implementation
-- {py:class}`bridge.data.builders.finetuning_dataset.FinetuningDatasetBuilder` - Dataset builder with packing support
-- {py:func}`bridge.training.gpt_step.get_packed_seq_params` - Packed sequence parameter extraction for training
+1. Packed-sequence support is recipe- and model-family-specific.
+2. Fine-tuning sequence packing should not be assumed to work with every other
+   training feature.
+3. Setting a distinct evaluation CP only reserves compatible data shapes;
+   activating it requires decentralized process groups and caller-managed eval
+   groups. The eval-CP example demonstrates topology plumbing, not a complete
+   real-data recipe; validation sharding and batch math must use the eval DP.
+4. Packed sequences improve efficiency primarily by reducing padding waste, not
+   by replacing long-context parallelism or memory-planning techniques.
+5. An Energon checkpoint restores the loader's buffered samples and selected
+   pack groups, but exact resumption still requires the same dataset, processor,
+   topology, sequence length, and packing-buffer configuration.
+6. `progress.txt` `Tokens` and the `time/tokens` runtime metric currently report
+   configured token capacity (`consumed_train_samples * model.seq_length`), not
+   exact packed-token utilization. Finite partial Energon packs can therefore
+   make those values larger than the physical token slots executed, and neither
+   metric excludes alignment padding to represent useful source tokens.
+
+## Related Docs
+
+- [docs/training/multi-token-prediction.md](multi-token-prediction.md)
+- [docs/performance-guide.md](../performance-guide.md)
+- [docs/training/hierarchical-context-parallel.md](hierarchical-context-parallel.md)
+- [tutorials/data/energon/README.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/tutorials/data/energon/README.md)
+- [skills/nemo-mbridge-perf-sequence-packing/SKILL.md](../skills/nemo-mbridge-perf-sequence-packing/SKILL.md)
+- [skills/nemo-mbridge-perf-sequence-packing/card.yaml](../skills/nemo-mbridge-perf-sequence-packing/card.yaml)

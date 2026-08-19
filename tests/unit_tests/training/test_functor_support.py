@@ -206,7 +206,7 @@ class TestFunctorWithPretrain:
         """Test pretrain works with a 4-arg functor."""
         gpt_model_cfg = create_test_gpt_config()
         checkpoint_cfg = create_test_checkpoint_config(save=None)
-        train_cfg = create_test_training_config(train_iters=100, skip_train=False)
+        train_cfg = create_test_training_config(train_iters=100)
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -260,7 +260,7 @@ class TestFunctorWithPretrain:
         """Test pretrain works with a stateful functor that tracks calls."""
         gpt_model_cfg = create_test_gpt_config()
         checkpoint_cfg = create_test_checkpoint_config(save=None)
-        train_cfg = create_test_training_config(train_iters=100, skip_train=False)
+        train_cfg = create_test_training_config(train_iters=100)
 
         container, og_ws, cfg_mod = create_test_config_container(
             world_size_override=1,
@@ -320,8 +320,25 @@ class TestFunctorStateDetectionEdgeCases:
                 return "typed state"
 
         functor = TypedStateFunctor()
+        state = Mock(spec=GlobalState)
         needs_injection = needs_global_state_injection(functor)
+        wrapped_functor = maybe_inject_state(functor, state)
+
         assert needs_injection is True  # Has GlobalState type hint
+        assert isinstance(wrapped_functor, partial)
+        assert wrapped_functor.args == (state,)
+
+    def test_function_with_forward_reference_state_parameter(self):
+        """Test that a string GlobalState annotation triggers state injection."""
+
+        def forward_step(state: "GlobalState", data_iterator, model):
+            return state
+
+        state = Mock(spec=GlobalState)
+        wrapped_function = maybe_inject_state(forward_step, state)
+
+        assert isinstance(wrapped_function, partial)
+        assert wrapped_function(Mock(), Mock()) is state
 
     def test_functor_with_mixed_parameters(self):
         """Test functor with mixed typed and untyped parameters."""

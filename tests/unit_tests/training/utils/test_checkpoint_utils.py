@@ -30,6 +30,8 @@ from megatron.bridge.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
     get_checkpoint_train_state_filename,
     get_hf_model_id_from_checkpoint,
+    is_checkpoint_iteration_directory,
+    is_hf_checkpoint_dir,
     read_run_config,
     read_train_state,
 )
@@ -294,7 +296,7 @@ class TestCheckpointUtils:
         assert result.iteration == 100
         assert result.epoch == 5
         assert result.step == 1000
-        mock_torch_load.assert_called_once_with("train_state.pt", map_location="cpu")
+        mock_torch_load.assert_called_once_with("train_state.pt", map_location="cpu", weights_only=True)
 
     @patch("megatron.bridge.training.utils.checkpoint_utils.get_rank_safe")
     @patch("megatron.bridge.training.utils.checkpoint_utils.get_world_size_safe")
@@ -467,10 +469,12 @@ class TestCheckpointUtils:
 
     # ===== ADVANCED TEST SCENARIOS =====
 
-    def test_concurrent_access_to_cached_functions(self):
+    def test_concurrent_access_to_cached_functions(self, tmp_path):
         """Test concurrent access to cached functions for thread safety."""
         config_data = {"model": {"type": "concurrent_test"}}
-        config_yaml = yaml.dump(config_data)
+        config_file = tmp_path / "concurrent_config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(config_data, f)
 
         results = []
         errors = []
@@ -483,9 +487,8 @@ class TestCheckpointUtils:
                         "megatron.bridge.training.utils.checkpoint_utils.torch.distributed.is_initialized",
                         return_value=False,
                     ),
-                    patch("builtins.open", mock_open(read_data=config_yaml)),
                 ):
-                    result = read_run_config("concurrent_config.yaml")
+                    result = read_run_config(str(config_file))
                     results.append(result)
             except Exception as e:
                 errors.append(e)
@@ -766,3 +769,86 @@ class TestCheckpointUtils:
             assert isinstance(result["model"]["learning_rate"], float)
             assert isinstance(result["flags"]["enabled"], bool)
             assert result["flags"]["debug"] is None
+
+    def test_is_iteration_dir_with_run_config(self, tmp_path):
+        """Test detection via run_config.yaml (Bridge checkpoint)."""
+        iter_dir = tmp_path / "iter_0001000"
+        iter_dir.mkdir()
+        (iter_dir / CONFIG_FILE).touch()
+
+        assert is_checkpoint_iteration_directory(str(iter_dir)) is True
+
+    def test_is_iteration_dir_with_train_state(self, tmp_path):
+        """Test detection via train_state.pt (Bridge per-iteration state)."""
+        iter_dir = tmp_path / "iter_0000800"
+        iter_dir.mkdir()
+        (iter_dir / TRAIN_STATE_FILE).touch()
+
+        assert is_checkpoint_iteration_directory(str(iter_dir)) is True
+
+    def test_is_iteration_dir_with_metadata_json(self, tmp_path):
+        """Test detection via metadata.json (torch_dist checkpoint)."""
+        iter_dir = tmp_path / "iter_0000500"
+        iter_dir.mkdir()
+        (iter_dir / "metadata.json").touch()
+
+        assert is_checkpoint_iteration_directory(str(iter_dir)) is True
+
+    def test_is_iteration_dir_with_dot_metadata(self, tmp_path):
+        """Test detection via .metadata (fsdp_dtensor checkpoint)."""
+        iter_dir = tmp_path / "iter_0000100"
+        iter_dir.mkdir()
+        (iter_dir / ".metadata").touch()
+
+        assert is_checkpoint_iteration_directory(str(iter_dir)) is True
+
+    def test_is_iteration_dir_empty_directory(self, tmp_path):
+        """Test that an empty directory is not detected as an iteration dir."""
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+
+        assert is_checkpoint_iteration_directory(str(empty_dir)) is False
+
+    def test_is_iteration_dir_none(self):
+        """Test that None returns False."""
+        assert is_checkpoint_iteration_directory(None) is False
+
+    def test_is_iteration_dir_nonexistent(self):
+        """Test that a nonexistent path returns False."""
+        assert is_checkpoint_iteration_directory("/nonexistent/iter_0000000") is False
+
+    def test_hf_model_dir_is_not_iteration_dir(self, tmp_path):
+        """A raw HF model directory should not be treated as a Megatron iteration directory."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "config.json").touch()
+        (hf_dir / "model.safetensors").touch()
+
+        assert is_hf_checkpoint_dir(str(hf_dir)) is True
+        assert is_checkpoint_iteration_directory(str(hf_dir)) is False
+        assert checkpoint_exists(str(hf_dir)) is False
+        assert checkpoint_exists(str(hf_dir)) or is_hf_checkpoint_dir(str(hf_dir))
+
+        adapter_dir = tmp_path / "adapter_only"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").touch()
+        (adapter_dir / "adapter_model.safetensors").touch()
+
+        assert is_hf_checkpoint_dir(str(adapter_dir)) is False
+
+    def test_checkpoint_exists_with_iteration_directory(self, tmp_path):
+        """Test checkpoint_exists detects a direct iteration directory."""
+        iter_dir = tmp_path / "iter_0001000"
+        iter_dir.mkdir()
+        (iter_dir / CONFIG_FILE).touch()
+
+        assert checkpoint_exists(str(iter_dir)) is True
+
+    def test_checkpoint_exists_prefers_iteration_dir_over_tracker(self, tmp_path):
+        """Test that a directory with both markers is still detected."""
+        ckpt_dir = tmp_path / "checkpoints"
+        ckpt_dir.mkdir()
+        (ckpt_dir / CONFIG_FILE).touch()
+        (ckpt_dir / f"{TRACKER_PREFIX}_{TRAIN_STATE_FILE}").touch()
+
+        assert checkpoint_exists(str(ckpt_dir)) is True

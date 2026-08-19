@@ -68,7 +68,7 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
-import torch
+import modelopt.torch.utils.distributed as dist
 from omegaconf import OmegaConf
 
 from megatron.bridge.recipes.llama import llama3_8b_pretrain_config as pretrain_config
@@ -152,14 +152,17 @@ def main() -> None:
     logger.info("------------------------------------------------------------------")
 
     # Load base configuration from the recipe as a Python dataclass
-    # If --hf-path is provided, pass it to the recipe function
-    recipe_kwargs = {}
+    # Pretrain configs use parameterless API
+    cfg: ConfigContainer = pretrain_config()
+    logger.info("Loaded base configuration")
+
+    # If --hf-path is provided, override the model's HuggingFace path
     if args.hf_path:
         logger.info(f"Using custom HuggingFace path: {args.hf_path}")
-        recipe_kwargs["hf_path"] = args.hf_path
+        # Import AutoBridge to create a new model provider with the custom HF path
+        from megatron.bridge.models import AutoBridge
 
-    cfg: ConfigContainer = pretrain_config(**recipe_kwargs)
-    logger.info("Loaded base configuration")
+        cfg.model = AutoBridge.from_hf_pretrained(args.hf_path).to_megatron_provider(load_weights=False)
 
     # Print configuration on rank 0
     if get_rank_safe() == 0:
@@ -192,7 +195,8 @@ def main() -> None:
 
     # Check for ModelOpt state
     checkpoint_to_check = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
-    if checkpoint_to_check and has_modelopt_state(checkpoint_to_check):
+    ckpt_step = None if cfg.checkpoint.pretrained_checkpoint else cfg.checkpoint.ckpt_step
+    if checkpoint_to_check and has_modelopt_state(checkpoint_to_check, ckpt_step=ckpt_step):
         cfg.model.restore_modelopt_state = True
 
     # Display final configuration
@@ -206,9 +210,7 @@ def main() -> None:
     pretrain(config=cfg, forward_step_func=forward_step)
 
     # Cleanup process group
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
+    dist.cleanup()
 
 
 if __name__ == "__main__":

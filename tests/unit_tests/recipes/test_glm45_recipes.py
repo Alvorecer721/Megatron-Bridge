@@ -26,6 +26,8 @@ from typing import Callable
 
 import pytest
 
+from tests.unit_tests.recipes.recipe_test_utils import patch_recipe_module_global
+
 
 _glm_module = importlib.import_module("megatron.bridge.recipes.glm")
 _GLM45_RECIPE_FUNCS = [
@@ -36,56 +38,13 @@ _GLM45_RECIPE_FUNCS = [
 
 
 def _safe_overrides_for(name: str) -> dict:
-    # Detect if this is a finetune recipe
-    is_finetune = "finetune" in name.lower()
+    """Return overrides for recipe functions.
 
-    overrides = {
-        "name": f"unit_{name}",
-        "dir": ".",
-        "train_iters": 10,
-        "global_batch_size": 2,
-        "micro_batch_size": 1,
-        "seq_length": 64,
-        "min_lr": 1e-5,
-        "lr_warmup_iters": 2,
-    }
-
-    if is_finetune:
-        # Finetuning-specific overrides
-        overrides.update(
-            {
-                "finetune_lr": 1e-4,
-                "pretrained_checkpoint": "/fake/checkpoint/path",
-            }
-        )
-        # Note: Finetuning recipes set parallelism internally based on PEFT vs full SFT
-        # Note: Finetuning always uses HF tokenizer, never null tokenizer
-    else:
-        # Pretrain-specific overrides
-        overrides.update(
-            {
-                "mock": True,
-                "lr": 1e-4,
-                "tensor_model_parallel_size": 1,
-                "pipeline_model_parallel_size": 1,
-                "context_parallel_size": 1,
-                "expert_model_parallel_size": 1,
-                "use_null_tokenizer": True,
-                "num_layers": 4,  # Override for faster testing
-            }
-        )
-
-        # Large models/variants may set additional flags in recipes
-        lname = name.lower()
-        if "355b" in lname or "106b" in lname:
-            overrides.update(
-                {
-                    "virtual_pipeline_model_parallel_size": None,
-                    "sequence_parallel": True,
-                }
-            )
-
-    return overrides
+    All configs (pretrain, SFT, PEFT) now use the parameterless API.
+    This function returns an empty dict since configs are modified after creation.
+    """
+    # All configs now use the parameterless API
+    return {}
 
 
 class _FakeModelCfg:
@@ -95,11 +54,14 @@ class _FakeModelCfg:
         # Set default attributes that recipes might set
         self.tensor_model_parallel_size = 1
         self.pipeline_model_parallel_size = 1
+        self.pipeline_model_parallel_layout = None
         self.pipeline_dtype = None
         self.virtual_pipeline_model_parallel_size = None
+        self.num_layers_in_first_pipeline_stage = None
+        self.num_layers_in_last_pipeline_stage = None
         self.context_parallel_size = 1
         self.expert_model_parallel_size = 1
-        self.expert_tensor_parallel_size = 1
+        self.expert_tensor_parallel_size = None
         self.sequence_parallel = False
         self.seq_length = 64
         self.num_layers = 4
@@ -124,6 +86,9 @@ class _FakeModelCfg:
         self.vocab_size = 151552  # GLM vocab size
 
     def finalize(self):
+        from megatron.bridge.models.transformer_config import _set_moe_expert_tensor_parallel_default
+
+        _set_moe_expert_tensor_parallel_default(self)
         return None
 
 
@@ -139,6 +104,23 @@ class _FakeBridge:
     @staticmethod
     def from_hf_pretrained(hf_path: str, **kwargs):
         return _FakeBridge()
+
+
+class _RealDepthFakeBridge(_FakeBridge):
+    """Fake AutoBridge that preserves the selected GLM-4.5 model depth."""
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+
+    def to_megatron_provider(self, load_weights: bool = False):
+        model = _FakeModelCfg()
+        model.num_layers = self.num_layers
+        return model
+
+    @staticmethod
+    def from_hf_pretrained(hf_path: str, **kwargs):
+        num_layers = 46 if hf_path.endswith("Air") else 92
+        return _RealDepthFakeBridge(num_layers)
 
 
 class _FakeTokenizer:
@@ -165,11 +147,9 @@ def _assert_basic_config(cfg):
     assert cfg.train.global_batch_size >= 1
     assert cfg.train.micro_batch_size >= 1
 
-    # Check sequence length (different attribute names for different dataset types)
-    if hasattr(cfg.dataset, "sequence_length"):
-        assert cfg.dataset.sequence_length >= 1  # GPTDatasetConfig
-    elif hasattr(cfg.dataset, "seq_length"):
-        assert cfg.dataset.seq_length >= 1  # FinetuningDatasetConfig / HFDatasetConfig
+    # Check sequence length for canonical dataset configs.
+    if hasattr(cfg.dataset, "seq_length"):
+        assert cfg.dataset.seq_length >= 1
     else:
         # Some other dataset type
         assert cfg.dataset is not None
@@ -178,26 +158,14 @@ def _assert_basic_config(cfg):
 @pytest.mark.parametrize("recipe_func", _GLM45_RECIPE_FUNCS)
 def test_each_glm45_recipe_builds_config(recipe_func: Callable, monkeypatch: pytest.MonkeyPatch):
     """Test that each GLM 4.5 recipe function builds a valid configuration."""
-    # Monkeypatch the provider classes to return fake model configs
-    from megatron.bridge.models.glm import glm45_provider
+    # Monkeypatch AutoBridge to return fake model configs (avoids HF I/O)
+    module_name = recipe_func.__module__
+    mod = importlib.import_module(module_name)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
-    # Create a fake provider class that returns a fake model config
-    class FakeProvider(_FakeModelCfg):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-
-    # Monkeypatch all provider classes
-    monkeypatch.setattr(glm45_provider, "GLMMoEModelProvider", FakeProvider)
-    monkeypatch.setattr(glm45_provider, "GLM45ModelProvider355B", FakeProvider)
-    monkeypatch.setattr(glm45_provider, "GLM45AirModelProvider106B", FakeProvider)
-
-    # For finetune recipes, also monkeypatch AutoBridge and AutoTokenizer
-    is_finetune = "finetune" in recipe_func.__name__.lower()
-    if is_finetune:
-        module_name = recipe_func.__module__
-        mod = importlib.import_module(module_name)
-        monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
-
+    # For SFT/PEFT recipes, also monkeypatch AutoTokenizer
+    is_sft_or_peft = "sft" in recipe_func.__name__.lower() or "peft" in recipe_func.__name__.lower()
+    if is_sft_or_peft:
         # Mock AutoTokenizer to avoid HF I/O
         import transformers
 
@@ -207,45 +175,56 @@ def test_each_glm45_recipe_builds_config(recipe_func: Callable, monkeypatch: pyt
             type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
         )
 
-    overrides = _safe_overrides_for(recipe_func.__name__)
-
-    cfg = recipe_func(**overrides)
+    # All configs now use the parameterless API
+    cfg = recipe_func()
 
     _assert_basic_config(cfg)
 
     # Ensure tokenizer choice matches recipe type
-    if is_finetune:
-        # Finetuning recipes always use HF tokenizer
+    if is_sft_or_peft:
+        # SFT/PEFT recipes always use HF tokenizer
         assert cfg.tokenizer.tokenizer_type == "HuggingFaceTokenizer"
         assert cfg.tokenizer.tokenizer_model is not None
     else:
-        # Pretrain recipes honor use_null_tokenizer override
-        if overrides.get("use_null_tokenizer"):
-            assert cfg.tokenizer.tokenizer_type == "NullTokenizer"
+        # Pretrain recipes use either NullTokenizer or HuggingFaceTokenizer
+        if cfg.tokenizer.tokenizer_type == "NullTokenizer":
+            assert cfg.tokenizer.vocab_size is not None
+        else:
+            assert cfg.tokenizer.tokenizer_type == "HuggingFaceTokenizer"
+            assert cfg.tokenizer.tokenizer_model is not None
 
     assert getattr(cfg.model, "tensor_model_parallel_size", 1) >= 1
     assert getattr(cfg.model, "pipeline_model_parallel_size", 1) >= 1
     assert getattr(cfg.model, "expert_model_parallel_size", 1) >= 1
 
 
-# GLM 4.5 finetune-specific tests
-_GLM45_FINETUNE_FUNCS = [
+# GLM 4.5 SFT-specific tests
+_GLM45_SFT_FUNCS = [
     getattr(_glm_module, name)
     for name in [
-        "glm45_355b_finetune_config",
-        "glm45_air_106b_finetune_config",
+        "glm45_355b_sft_config",
+        "glm45_air_106b_sft_config",
+    ]
+    if callable(getattr(_glm_module, name, None))
+]
+
+# GLM 4.5 PEFT-specific tests
+_GLM45_PEFT_FUNCS = [
+    getattr(_glm_module, name)
+    for name in [
+        "glm45_355b_peft_config",
+        "glm45_air_106b_peft_config",
     ]
     if callable(getattr(_glm_module, name, None))
 ]
 
 
-@pytest.mark.parametrize("recipe_func", _GLM45_FINETUNE_FUNCS)
-@pytest.mark.parametrize("peft", ["lora", "dora", None])
-def test_glm45_finetune_peft_vs_full_sft(recipe_func: Callable, peft: str, monkeypatch: pytest.MonkeyPatch):
-    """Test that PEFT and full SFT configurations are correctly applied for GLM 4.5 models."""
+@pytest.mark.parametrize("recipe_func", _GLM45_SFT_FUNCS)
+def test_glm45_sft_config_builds(recipe_func: Callable, monkeypatch: pytest.MonkeyPatch):
+    """Test that each GLM 4.5 SFT recipe builds a valid config."""
     module_name = recipe_func.__module__
     mod = importlib.import_module(module_name)
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
     # Mock AutoTokenizer to avoid HF I/O
     import transformers
@@ -256,26 +235,79 @@ def test_glm45_finetune_peft_vs_full_sft(recipe_func: Callable, peft: str, monke
         type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
     )
 
-    overrides = _safe_overrides_for(recipe_func.__name__)
-    overrides["peft"] = peft
-
-    cfg = recipe_func(**overrides)
+    # SFT configs use the parameterless API
+    cfg = recipe_func()
 
     _assert_basic_config(cfg)
 
-    # Check PEFT config presence
-    if peft in ["lora", "dora"]:
-        assert cfg.peft is not None
-    elif peft is None:
-        assert cfg.peft is None
+    # SFT always uses HF tokenizer
+    assert cfg.tokenizer.tokenizer_type == "HuggingFaceTokenizer"
+    assert cfg.tokenizer.tokenizer_model is not None
+
+    # SFT should not have PEFT config
+    assert cfg.peft is None
+
+
+@pytest.mark.parametrize("recipe_func", _GLM45_PEFT_FUNCS)
+def test_glm45_peft_config_builds(recipe_func: Callable, monkeypatch: pytest.MonkeyPatch):
+    """Test that each GLM 4.5 PEFT recipe builds a valid config."""
+    module_name = recipe_func.__module__
+    mod = importlib.import_module(module_name)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
+
+    # Mock AutoTokenizer to avoid HF I/O
+    import transformers
+
+    monkeypatch.setattr(
+        transformers,
+        "AutoTokenizer",
+        type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
+    )
+
+    # PEFT configs take peft_scheme parameter (default is "lora")
+    cfg = recipe_func()
+
+    _assert_basic_config(cfg)
+
+    # PEFT always uses HF tokenizer
+    assert cfg.tokenizer.tokenizer_type == "HuggingFaceTokenizer"
+    assert cfg.tokenizer.tokenizer_model is not None
+
+    # PEFT should have PEFT config
+    assert cfg.peft is not None
+
+
+@pytest.mark.parametrize("recipe_func", _GLM45_PEFT_FUNCS)
+@pytest.mark.parametrize("peft_scheme", ["lora", "dora"])
+def test_glm45_peft_schemes(recipe_func: Callable, peft_scheme: str, monkeypatch: pytest.MonkeyPatch):
+    """Test that PEFT configurations are correctly applied for different schemes."""
+    module_name = recipe_func.__module__
+    mod = importlib.import_module(module_name)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
+
+    # Mock AutoTokenizer to avoid HF I/O
+    import transformers
+
+    monkeypatch.setattr(
+        transformers,
+        "AutoTokenizer",
+        type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
+    )
+
+    cfg = recipe_func(peft_scheme=peft_scheme)
+
+    _assert_basic_config(cfg)
+
+    # PEFT should have PEFT config
+    assert cfg.peft is not None
 
 
 def test_glm45_355b_lora_defaults(monkeypatch: pytest.MonkeyPatch):
     """Test that 355B LoRA has correct default parallelism: TP=2, PP=4, EP=4 (32 GPUs)."""
-    from megatron.bridge.recipes.glm import glm45_355b_finetune_config
+    from megatron.bridge.recipes.glm import glm45_355b_peft_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
     # Mock AutoTokenizer to avoid HF I/O
     import transformers
@@ -286,10 +318,7 @@ def test_glm45_355b_lora_defaults(monkeypatch: pytest.MonkeyPatch):
         type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
     )
 
-    overrides = _safe_overrides_for("glm45_355b_finetune_config")
-    overrides["peft"] = "lora"
-
-    cfg = glm45_355b_finetune_config(**overrides)
+    cfg = glm45_355b_peft_config(peft_scheme="lora")
 
     _assert_basic_config(cfg)
 
@@ -306,10 +335,10 @@ def test_glm45_355b_lora_defaults(monkeypatch: pytest.MonkeyPatch):
 
 def test_glm45_355b_full_sft_defaults(monkeypatch: pytest.MonkeyPatch):
     """Test that 355B full SFT uses same parallelism as pretrain: TP=2, PP=8, EP=16 (256 GPUs)."""
-    from megatron.bridge.recipes.glm import glm45_355b_finetune_config
+    from megatron.bridge.recipes.glm import glm45_355b_sft_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
     # Mock AutoTokenizer to avoid HF I/O
     import transformers
@@ -320,10 +349,7 @@ def test_glm45_355b_full_sft_defaults(monkeypatch: pytest.MonkeyPatch):
         type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
     )
 
-    overrides = _safe_overrides_for("glm45_355b_finetune_config")
-    overrides["peft"] = None  # Use None instead of "none" string
-
-    cfg = glm45_355b_finetune_config(**overrides)
+    cfg = glm45_355b_sft_config()
 
     _assert_basic_config(cfg)
 
@@ -331,15 +357,18 @@ def test_glm45_355b_full_sft_defaults(monkeypatch: pytest.MonkeyPatch):
     assert cfg.model.tensor_model_parallel_size == 2
     assert cfg.model.pipeline_model_parallel_size == 8
     assert cfg.model.expert_model_parallel_size == 16
+    assert cfg.model.expert_tensor_parallel_size is None
+    cfg.model.finalize()
+    assert cfg.model.expert_tensor_parallel_size == 1
     assert cfg.peft is None
 
 
 def test_glm45_air_106b_lora_defaults(monkeypatch: pytest.MonkeyPatch):
     """Test that Air 106B LoRA has correct default parallelism: TP=1, PP=2, EP=4 (8 GPUs, 1 node)."""
-    from megatron.bridge.recipes.glm import glm45_air_106b_finetune_config
+    from megatron.bridge.recipes.glm import glm45_air_106b_peft_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
     # Mock AutoTokenizer to avoid HF I/O
     import transformers
@@ -350,10 +379,7 @@ def test_glm45_air_106b_lora_defaults(monkeypatch: pytest.MonkeyPatch):
         type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
     )
 
-    overrides = _safe_overrides_for("glm45_air_106b_finetune_config")
-    overrides["peft"] = "lora"
-
-    cfg = glm45_air_106b_finetune_config(**overrides)
+    cfg = glm45_air_106b_peft_config(peft_scheme="lora")
 
     _assert_basic_config(cfg)
 
@@ -370,10 +396,10 @@ def test_glm45_air_106b_lora_defaults(monkeypatch: pytest.MonkeyPatch):
 
 def test_glm45_air_106b_full_sft_defaults(monkeypatch: pytest.MonkeyPatch):
     """Test that Air 106B full SFT uses same parallelism as pretrain: TP=1, PP=4, EP=8 (32 GPUs)."""
-    from megatron.bridge.recipes.glm import glm45_air_106b_finetune_config
+    from megatron.bridge.recipes.glm import glm45_air_106b_sft_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
     # Mock AutoTokenizer to avoid HF I/O
     import transformers
@@ -384,10 +410,7 @@ def test_glm45_air_106b_full_sft_defaults(monkeypatch: pytest.MonkeyPatch):
         type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
     )
 
-    overrides = _safe_overrides_for("glm45_air_106b_finetune_config")
-    overrides["peft"] = None  # Use None instead of "none" string
-
-    cfg = glm45_air_106b_finetune_config(**overrides)
+    cfg = glm45_air_106b_sft_config()
 
     _assert_basic_config(cfg)
 
@@ -403,11 +426,10 @@ def test_glm45_355b_pretrain_defaults(monkeypatch: pytest.MonkeyPatch):
     from megatron.bridge.recipes.glm import glm45_355b_pretrain_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
-    overrides = _safe_overrides_for("glm45_355b_pretrain_config")
-
-    cfg = glm45_355b_pretrain_config(**overrides)
+    # Pretrain configs use the new parameterless API
+    cfg = glm45_355b_pretrain_config()
 
     _assert_basic_config(cfg)
 
@@ -423,11 +445,10 @@ def test_glm45_air_106b_pretrain_defaults(monkeypatch: pytest.MonkeyPatch):
     from megatron.bridge.recipes.glm import glm45_air_106b_pretrain_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
-    overrides = _safe_overrides_for("glm45_air_106b_pretrain_config")
-
-    cfg = glm45_air_106b_pretrain_config(**overrides)
+    # Pretrain configs use the new parameterless API
+    cfg = glm45_air_106b_pretrain_config()
 
     _assert_basic_config(cfg)
 
@@ -438,13 +459,41 @@ def test_glm45_air_106b_pretrain_defaults(monkeypatch: pytest.MonkeyPatch):
     assert hasattr(cfg.model, "mtp_loss_scaling_factor")
 
 
-@pytest.mark.parametrize("packed", [True, False])
-def test_glm45_finetune_packed_sequence_assertion(packed: bool, monkeypatch: pytest.MonkeyPatch):
-    """Test that packed sequence configuration raises assertion for GLM 4.5."""
-    from megatron.bridge.recipes.glm import glm45_355b_finetune_config
+@pytest.mark.parametrize(
+    "recipe_name,num_layers",
+    [
+        ("glm45_355b_pretrain_config", 92),
+        ("glm45_355b_sft_config", 92),
+        ("glm45_air_106b_pretrain_config", 46),
+        ("glm45_air_106b_sft_config", 46),
+    ],
+)
+def test_glm45_pipeline_partition_covers_real_model_depth(
+    recipe_name: str,
+    num_layers: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """GLM-4.5 recipe defaults should partition every real decoder layer."""
+    from megatron.core.transformer.transformer_block import get_num_layers_to_build
+
+    recipe_func = getattr(_glm_module, recipe_name)
+    patch_recipe_module_global(monkeypatch, recipe_func, "AutoBridge", _RealDepthFakeBridge)
+
+    cfg = recipe_func()
+    layers_per_stage = [
+        get_num_layers_to_build(cfg.model, pp_rank=pp_rank)
+        for pp_rank in range(cfg.model.pipeline_model_parallel_size)
+    ]
+
+    assert sum(layers_per_stage) == num_layers
+
+
+def test_glm45_sft_offline_packing_is_disabled(monkeypatch: pytest.MonkeyPatch):
+    """Test that unsupported offline packing remains disabled for GLM-4.5."""
+    from megatron.bridge.recipes.glm import glm45_355b_sft_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
     # Mock AutoTokenizer to avoid HF I/O
     import transformers
@@ -455,17 +504,11 @@ def test_glm45_finetune_packed_sequence_assertion(packed: bool, monkeypatch: pyt
         type("FakeAutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: _FakeTokenizer())}),
     )
 
-    overrides = _safe_overrides_for("glm45_355b_finetune_config")
-    overrides["packed_sequence"] = packed
+    cfg = glm45_355b_sft_config()
 
-    if packed:
-        # Packed sequence should raise an assertion error
-        with pytest.raises(AssertionError, match="Packed sequence is not supported"):
-            glm45_355b_finetune_config(**overrides)
-    else:
-        # Unpacked should work fine
-        cfg = glm45_355b_finetune_config(**overrides)
-        _assert_basic_config(cfg)
+    _assert_basic_config(cfg)
+    assert cfg.dataset.enable_offline_packing is False
+    assert cfg.dataset.offline_packing_specs is None
 
 
 def test_glm45_mtp_configuration(monkeypatch: pytest.MonkeyPatch):
@@ -473,19 +516,18 @@ def test_glm45_mtp_configuration(monkeypatch: pytest.MonkeyPatch):
     from megatron.bridge.recipes.glm import glm45_355b_pretrain_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
-    overrides = _safe_overrides_for("glm45_355b_pretrain_config")
-    overrides["mtp_num_layers"] = 2
-    overrides["mtp_loss_scaling_factor"] = 0.5
-
-    cfg = glm45_355b_pretrain_config(**overrides)
+    # Pretrain configs use the new parameterless API
+    cfg = glm45_355b_pretrain_config()
 
     _assert_basic_config(cfg)
 
-    # Check MTP configuration
-    assert cfg.model.mtp_num_layers == 2
-    assert cfg.model.mtp_loss_scaling_factor == 0.5
+    # Check MTP configuration exists and has valid values
+    assert hasattr(cfg.model, "mtp_num_layers")
+    assert hasattr(cfg.model, "mtp_loss_scaling_factor")
+    assert cfg.model.mtp_num_layers >= 0
+    assert cfg.model.mtp_loss_scaling_factor >= 0
 
 
 def test_glm45_recompute_configuration(monkeypatch: pytest.MonkeyPatch):
@@ -493,18 +535,14 @@ def test_glm45_recompute_configuration(monkeypatch: pytest.MonkeyPatch):
     from megatron.bridge.recipes.glm import glm45_355b_pretrain_config
 
     mod = importlib.import_module("megatron.bridge.recipes.glm.glm45")
-    monkeypatch.setattr(mod, "AutoBridge", _FakeBridge)
+    patch_recipe_module_global(monkeypatch, mod, "AutoBridge", _FakeBridge)
 
-    overrides = _safe_overrides_for("glm45_355b_pretrain_config")
-    overrides["recompute_granularity"] = "full"
-    overrides["recompute_method"] = "uniform"
-    overrides["recompute_num_layers"] = 2
-
-    cfg = glm45_355b_pretrain_config(**overrides)
+    # Pretrain configs use the new parameterless API
+    cfg = glm45_355b_pretrain_config()
 
     _assert_basic_config(cfg)
 
-    # Check recompute configuration
-    assert cfg.model.recompute_granularity == "full"
-    assert cfg.model.recompute_method == "uniform"
-    assert cfg.model.recompute_num_layers == 2
+    # Check recompute configuration exists
+    assert hasattr(cfg.model, "recompute_granularity")
+    assert hasattr(cfg.model, "recompute_method")
+    assert hasattr(cfg.model, "recompute_num_layers")

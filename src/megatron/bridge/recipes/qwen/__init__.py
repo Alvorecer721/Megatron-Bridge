@@ -12,59 +12,93 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Qwen3 GB200 models
+from .gb200.qwen3_moe import qwen3_30b_a3b_pretrain_8gpu_gb200_fp8mx_functional_config
+
+# Qwen3.5 GB200 models
+from .gb200.qwen35 import (
+    qwen35_text_9b_pretrain_8gpu_gb200_bf16_config,
+    qwen35_text_35b_a3b_pretrain_8gpu_gb200_bf16_config,
+)
+
 # Qwen2 models
 from .qwen2 import (
-    qwen2_1p5b_finetune_config,
+    qwen2_1p5b_peft_config,
     qwen2_1p5b_pretrain_config,
-    qwen2_7b_finetune_config,
+    qwen2_1p5b_sft_config,
+    qwen2_7b_peft_config,
     qwen2_7b_pretrain_config,
-    qwen2_72b_finetune_config,
+    qwen2_7b_sft_config,
+    qwen2_72b_peft_config,
     qwen2_72b_pretrain_config,
-    qwen2_500m_finetune_config,
+    qwen2_72b_sft_config,
+    qwen2_500m_peft_config,
     qwen2_500m_pretrain_config,
-    qwen25_1p5b_finetune_config,
+    qwen2_500m_sft_config,
+    qwen25_1p5b_peft_config,
     qwen25_1p5b_pretrain_config,
-    qwen25_7b_finetune_config,
+    qwen25_1p5b_sft_config,
+    qwen25_7b_peft_config,
     qwen25_7b_pretrain_config,
-    qwen25_14b_finetune_config,
+    qwen25_7b_sft_config,
+    qwen25_14b_peft_config,
     qwen25_14b_pretrain_config,
-    qwen25_32b_finetune_config,
+    qwen25_14b_sft_config,
+    qwen25_32b_peft_config,
     qwen25_32b_pretrain_config,
-    qwen25_72b_finetune_config,
+    qwen25_32b_sft_config,
+    qwen25_72b_peft_config,
     qwen25_72b_pretrain_config,
-    qwen25_500m_finetune_config,
+    qwen25_72b_sft_config,
+    qwen25_500m_peft_config,
     qwen25_500m_pretrain_config,
+    qwen25_500m_sft_config,
 )
 
 # Qwen3 models
 from .qwen3 import (
-    qwen3_1p7b_finetune_config,
+    qwen3_1p7b_peft_config,
     qwen3_1p7b_pretrain_config,
-    qwen3_4b_finetune_config,
+    qwen3_1p7b_sft_config,
+    qwen3_4b_peft_config,
     qwen3_4b_pretrain_config,
-    qwen3_8b_finetune_config,
+    qwen3_4b_sft_config,
+    qwen3_8b_peft_config,
     qwen3_8b_pretrain_config,
-    qwen3_14b_finetune_config,
+    qwen3_8b_sft_32k_config,
+    qwen3_8b_sft_config,
+    qwen3_14b_peft_config,
     qwen3_14b_pretrain_config,
-    qwen3_32b_finetune_config,
+    qwen3_14b_sft_config,
+    qwen3_32b_peft_config,
     qwen3_32b_pretrain_config,
-    qwen3_600m_finetune_config,
+    qwen3_32b_sft_config,
+    qwen3_600m_peft_config,
     qwen3_600m_pretrain_config,
+    qwen3_600m_sft_128k_config,
+    qwen3_600m_sft_config,
+    qwen3_600m_sft_yarn_128k_config,
 )
 
 # Qwen3 MoE models
 from .qwen3_moe import (
-    qwen3_30b_a3b_finetune_config,
+    qwen3_30b_a3b_peft_config,
     qwen3_30b_a3b_pretrain_config,
-    qwen3_235b_a22b_finetune_config,
+    qwen3_30b_a3b_sft_config,
+    qwen3_235b_a22b_peft_config,
     qwen3_235b_a22b_pretrain_config,
+    qwen3_235b_a22b_sft_config,
 )
 
 # Qwen3-Next models
 from .qwen3_next import (
-    qwen3_next_80b_a3b_finetune_config,
+    qwen3_next_80b_a3b_peft_config,
     qwen3_next_80b_a3b_pretrain_config,
+    qwen3_next_80b_a3b_sft_config,
 )
+
+# Qwen3.5 text models
+from .qwen35 import qwen35_text_9b_pretrain_config, qwen35_text_35b_a3b_pretrain_config
 
 
 __all__ = [
@@ -73,10 +107,14 @@ __all__ = [
     "qwen2_1p5b_pretrain_config",
     "qwen2_7b_pretrain_config",
     "qwen2_72b_pretrain_config",
-    "qwen2_500m_finetune_config",
-    "qwen2_1p5b_finetune_config",
-    "qwen2_7b_finetune_config",
-    "qwen2_72b_finetune_config",
+    "qwen2_500m_sft_config",
+    "qwen2_1p5b_sft_config",
+    "qwen2_7b_sft_config",
+    "qwen2_72b_sft_config",
+    "qwen2_500m_peft_config",
+    "qwen2_1p5b_peft_config",
+    "qwen2_7b_peft_config",
+    "qwen2_72b_peft_config",
     # Qwen2.5 models
     "qwen25_500m_pretrain_config",
     "qwen25_1p5b_pretrain_config",
@@ -84,12 +122,18 @@ __all__ = [
     "qwen25_14b_pretrain_config",
     "qwen25_32b_pretrain_config",
     "qwen25_72b_pretrain_config",
-    "qwen25_500m_finetune_config",
-    "qwen25_1p5b_finetune_config",
-    "qwen25_7b_finetune_config",
-    "qwen25_14b_finetune_config",
-    "qwen25_32b_finetune_config",
-    "qwen25_72b_finetune_config",
+    "qwen25_500m_sft_config",
+    "qwen25_1p5b_sft_config",
+    "qwen25_7b_sft_config",
+    "qwen25_14b_sft_config",
+    "qwen25_32b_sft_config",
+    "qwen25_72b_sft_config",
+    "qwen25_500m_peft_config",
+    "qwen25_1p5b_peft_config",
+    "qwen25_7b_peft_config",
+    "qwen25_14b_peft_config",
+    "qwen25_32b_peft_config",
+    "qwen25_72b_peft_config",
     # Qwen3 models
     "qwen3_600m_pretrain_config",
     "qwen3_1p7b_pretrain_config",
@@ -97,18 +141,36 @@ __all__ = [
     "qwen3_8b_pretrain_config",
     "qwen3_14b_pretrain_config",
     "qwen3_32b_pretrain_config",
-    "qwen3_600m_finetune_config",
-    "qwen3_1p7b_finetune_config",
-    "qwen3_4b_finetune_config",
-    "qwen3_8b_finetune_config",
-    "qwen3_14b_finetune_config",
-    "qwen3_32b_finetune_config",
+    "qwen3_600m_sft_config",
+    "qwen3_600m_sft_128k_config",
+    "qwen3_600m_sft_yarn_128k_config",
+    "qwen3_1p7b_sft_config",
+    "qwen3_4b_sft_config",
+    "qwen3_8b_sft_config",
+    "qwen3_8b_sft_32k_config",
+    "qwen3_14b_sft_config",
+    "qwen3_32b_sft_config",
+    "qwen3_600m_peft_config",
+    "qwen3_1p7b_peft_config",
+    "qwen3_4b_peft_config",
+    "qwen3_8b_peft_config",
+    "qwen3_14b_peft_config",
+    "qwen3_32b_peft_config",
     # Qwen3 MoE models
     "qwen3_30b_a3b_pretrain_config",
-    "qwen3_30b_a3b_finetune_config",
+    "qwen3_30b_a3b_pretrain_8gpu_gb200_fp8mx_functional_config",
+    "qwen3_30b_a3b_sft_config",
+    "qwen3_30b_a3b_peft_config",
     "qwen3_235b_a22b_pretrain_config",
-    "qwen3_235b_a22b_finetune_config",
+    "qwen3_235b_a22b_sft_config",
+    "qwen3_235b_a22b_peft_config",
     # Qwen3-Next models
     "qwen3_next_80b_a3b_pretrain_config",
-    "qwen3_next_80b_a3b_finetune_config",
+    "qwen3_next_80b_a3b_sft_config",
+    "qwen3_next_80b_a3b_peft_config",
+    # Qwen3.5 text models
+    "qwen35_text_9b_pretrain_config",
+    "qwen35_text_9b_pretrain_8gpu_gb200_bf16_config",
+    "qwen35_text_35b_a3b_pretrain_config",
+    "qwen35_text_35b_a3b_pretrain_8gpu_gb200_bf16_config",
 ]

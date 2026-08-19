@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
-from megatron.bridge.training.utils.visual_inputs import Qwen2_5_VLVisualInputs
-from megatron.bridge.training.vlm_step import forward_step, get_batch, get_batch_from_iterator
+from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
+from megatron.bridge.training.vlm_step import (
+    forward_step,
+    get_batch,
+    get_batch_from_iterator,
+)
 
 
 class _Iterator:
@@ -33,6 +38,15 @@ class _Iterator:
         return self.batch
 
 
+class _NoCudaTensor(torch.Tensor):
+    def cuda(self, non_blocking=False):  # type: ignore[override]
+        return self
+
+
+def _as_nocuda(tensor):
+    return tensor.as_subclass(_NoCudaTensor)
+
+
 def _make_batch(device="cpu"):
     # Minimal text tensors
     tokens = torch.tensor([[1, 2, 3]], device=device)
@@ -45,7 +59,7 @@ def _make_batch(device="cpu"):
     # Visual inputs container
     pixel_values = torch.randn(1, 2, 3, 4, 4, device=device)
     image_grid_thw = torch.tensor([[[1, 2, 2], [1, 2, 2]]], device=device)
-    vi = Qwen2_5_VLVisualInputs(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+    vi = GenericVisualInputs(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
 
     batch = {
         "tokens": tokens,
@@ -57,6 +71,64 @@ def _make_batch(device="cpu"):
         "visual_inputs": vi,
     }
     return batch
+
+
+def _make_forward_step_state():
+    class _Timer:
+        def __call__(self, *args, **kwargs):  # noqa: ARG002
+            return self
+
+        def start(self):
+            return self
+
+        def stop(self):
+            return self
+
+    class _StragglerTimer:
+        def __call__(self, *args, **kwargs):  # noqa: ARG002
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):  # noqa: ARG002
+            return False
+
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model": type("M", (), {"seq_length": 16, "pipeline_model_parallel_size": 1})(),
+            "dataset": type("D", (), {"skip_getting_attention_mask_from_dataset": True})(),
+            "rerun_state_machine": type("R", (), {"check_for_nan_in_loss": False, "check_for_spiky_loss": False})(),
+        },
+    )()
+    return type("State", (), {"cfg": cfg, "timers": _Timer(), "straggler_timer": _StragglerTimer()})()
+
+
+def _patch_forward_step_deps(monkeypatch, model):
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self, non_blocking=False: self)
+    monkeypatch.setattr("megatron.bridge.training.vlm_step.get_model_config", lambda _: model.config, raising=True)
+    monkeypatch.setattr(
+        "megatron.bridge.training.vlm_step.get_pg_collection", lambda _: model.pg_collection, raising=True
+    )
+    monkeypatch.setattr("megatron.bridge.training.vlm_step.is_pp_first_stage", lambda _: True, raising=True)
+    monkeypatch.setattr("megatron.bridge.training.vlm_step.is_pp_last_stage", lambda _: True, raising=True)
+
+
+def _make_visual_forward_batch():
+    return {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[2, 3, 4, -100]]),
+        "loss_mask": torch.ones(1, 4),
+        "position_ids": torch.arange(4).unsqueeze(0),
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "visual_inputs": GenericVisualInputs(
+            pixel_values=torch.randn(1, 3, 4, 4),
+            image_position_ids=torch.zeros(1, 4, 2, dtype=torch.long),
+            mm_token_type_ids=torch.ones(1, 4, dtype=torch.long),
+        ),
+    }
 
 
 def test_get_batch_from_iterator_moves_visual_inputs_to_cuda(monkeypatch):
@@ -87,12 +159,231 @@ def test_get_batch_from_iterator_moves_visual_inputs_to_cuda(monkeypatch):
 
     assert "visual_inputs" in out
     out_vi = out["visual_inputs"]
-    assert isinstance(out_vi, Qwen2_5_VLVisualInputs)
+    assert isinstance(out_vi, GenericVisualInputs)
     # Verify fields are preserved
     assert out_vi.pixel_values is not None and out_vi.image_grid_thw is not None
 
 
-def test_get_batch_padding_paths(monkeypatch):
+def test_get_batch_from_iterator_projects_visual_payload_on_middle_pp_stage():
+    batch = _make_batch()
+    for key in ["tokens", "input_ids", "position_ids", "labels", "loss_mask", "attention_mask"]:
+        batch[key] = _as_nocuda(batch[key])
+    vi = batch["visual_inputs"]
+    original_pixel_values = vi.pixel_values
+    vi.pixel_values = _as_nocuda(vi.pixel_values)
+    vi.image_grid_thw = _as_nocuda(vi.image_grid_thw)
+
+    out = get_batch_from_iterator(
+        _Iterator(batch),
+        use_mtp=False,
+        skip_getting_attention_mask_from_dataset=True,
+        is_first_pp_stage=False,
+        is_last_pp_stage=False,
+    )
+
+    out_vi = out["visual_inputs"]
+    assert isinstance(out_vi, GenericVisualInputs)
+    assert out_vi.pixel_values is None
+    assert out_vi.image_grid_thw is not None
+    assert vi.pixel_values is not None
+    assert vi.pixel_values.shape == original_pixel_values.shape
+    # Token and position IDs stay available to every PP stage.
+    assert out["input_ids"] is not None
+
+
+def test_get_batch_from_iterator_keeps_input_ids_with_multiaxis_position_ids():
+    batch = _make_batch()
+    batch["position_ids"] = torch.arange(3).view(1, 1, 3).expand(3, 1, -1).clone()
+    for key in ["tokens", "input_ids", "position_ids", "labels", "loss_mask", "attention_mask"]:
+        batch[key] = _as_nocuda(batch[key])
+    vi = batch["visual_inputs"]
+    vi.pixel_values = _as_nocuda(vi.pixel_values)
+    vi.image_grid_thw = _as_nocuda(vi.image_grid_thw)
+
+    out = get_batch_from_iterator(
+        _Iterator(batch),
+        use_mtp=False,
+        skip_getting_attention_mask_from_dataset=True,
+        is_first_pp_stage=False,
+        is_last_pp_stage=False,
+    )
+
+    assert out["tokens"] is not None
+    assert out["input_ids"] is not None
+    assert out["position_ids"].shape == (3, 1, 3)
+    assert out["visual_inputs"].pixel_values is None
+    assert out["visual_inputs"].image_grid_thw is not None
+
+
+class _MockProcessGroup:
+    """Mock process group with rank/size methods for testing."""
+
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
+
+
+class _MockPGCollection:
+    """Mock PG collection for testing."""
+
+    def __init__(self, cp_size=1):
+        self.pp = _MockProcessGroup()
+        self.tp = _MockProcessGroup()
+        self._cp_size = cp_size
+
+    @property
+    def cp(self):
+        pg = _MockProcessGroup()
+        pg.size = lambda: self._cp_size
+        return pg
+
+
+class _ForwardModelBase(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = type("C", (), {"mtp_num_layers": 0, "overlap_moe_expert_parallel_comm": False})()
+        self.pg_collection = _MockPGCollection()
+        self.received_kwargs = None
+
+
+class _ForwardWrapper(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.config = module.config
+        self.pg_collection = module.pg_collection
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+class _Gemma4LikeForwardModel(_ForwardModelBase):
+    def forward(
+        self,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        labels=None,
+        loss_mask=None,
+        pixel_values=None,
+        image_position_ids=None,
+    ):
+        self.received_kwargs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "pixel_values": pixel_values,
+            "image_position_ids": image_position_ids,
+        }
+        return torch.tensor(0.0)
+
+
+class _MmTokenTypeForwardModel(_ForwardModelBase):
+    def forward(
+        self,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        labels=None,
+        loss_mask=None,
+        pixel_values=None,
+        image_position_ids=None,
+        mm_token_type_ids=None,
+    ):
+        self.received_kwargs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "pixel_values": pixel_values,
+            "image_position_ids": image_position_ids,
+            "mm_token_type_ids": mm_token_type_ids,
+        }
+        return torch.tensor(0.0)
+
+
+class _PackedForwardModel(_ForwardModelBase):
+    def forward(
+        self,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        labels=None,
+        loss_mask=None,
+        packed_seq_params=None,
+    ):
+        self.received_kwargs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "packed_seq_params": packed_seq_params,
+        }
+        return torch.tensor(0.0)
+
+
+def test_forward_step_filters_unsupported_visual_kwargs(monkeypatch):
+    inner_model = _Gemma4LikeForwardModel()
+    model = _ForwardWrapper(inner_model)
+    _patch_forward_step_deps(monkeypatch, model)
+
+    output, _ = forward_step(_make_forward_step_state(), _Iterator(_make_visual_forward_batch()), model)
+
+    assert output.item() == 0.0
+    assert inner_model.received_kwargs is not None
+    assert inner_model.received_kwargs["pixel_values"] is not None
+    assert inner_model.received_kwargs["image_position_ids"] is not None
+    assert "mm_token_type_ids" not in inner_model.received_kwargs
+
+
+def test_forward_step_preserves_supported_mm_token_type_ids(monkeypatch):
+    inner_model = _MmTokenTypeForwardModel()
+    model = _ForwardWrapper(inner_model)
+    _patch_forward_step_deps(monkeypatch, model)
+
+    output, _ = forward_step(_make_forward_step_state(), _Iterator(_make_visual_forward_batch()), model)
+
+    assert output.item() == 0.0
+    assert inner_model.received_kwargs is not None
+    assert inner_model.received_kwargs["mm_token_type_ids"] is not None
+
+
+def test_forward_step_preserves_independent_image_flops_boundaries(monkeypatch):
+    inner_model = _Gemma4LikeForwardModel()
+    model = _ForwardWrapper(inner_model)
+    _patch_forward_step_deps(monkeypatch, model)
+    state = _make_forward_step_state()
+    state.cfg.model.vision_config = type("Vision", (), {"spatial_merge_size": 2})()
+    batch = _make_visual_forward_batch()
+    batch["visual_inputs"].image_grid_thw = torch.tensor([[1, 10, 10], [1, 10, 10]])
+
+    forward_step(state, _Iterator(batch), model)
+
+    assert state._flops_vision_patch_sum == 200
+    assert state._flops_vision_patch_sq_sum == 20_000
+    assert state._flops_vision_merged_token_sum == 50
+    assert state._flops_requires_global_reduce is True
+
+
+def test_forward_step_rejects_deferred_in_batch_packing(monkeypatch):
+    inner_model = _PackedForwardModel()
+    model = _ForwardWrapper(inner_model)
+    _patch_forward_step_deps(monkeypatch, model)
+    state = _make_forward_step_state()
+    state.cfg.dataset.enable_in_batch_packing = True
+    state.cfg.dataset.defer_in_batch_packing_to_step = True
+
+    with pytest.raises(ValueError, match="requires collate-time in-batch packing"):
+        forward_step(state, _Iterator(_make_visual_forward_batch()), model)
+
+
+def test_get_batch_consumes_collated_sequence_shape(monkeypatch):
     # Simulate both first and last pipeline stages so tensors are returned
     monkeypatch.setattr("megatron.core.pipeline_parallel.utils.is_pp_first_stage", lambda pg: True, raising=True)
     monkeypatch.setattr("megatron.core.pipeline_parallel.utils.is_pp_last_stage", lambda pg: True, raising=True)
@@ -100,7 +391,7 @@ def test_get_batch_padding_paths(monkeypatch):
     # Disable context parallel slicing effects
     monkeypatch.setattr(
         "megatron.core.utils.get_batch_on_this_cp_rank",
-        lambda x: x,
+        lambda x, **kwargs: x,
         raising=True,
     )
 
@@ -120,9 +411,10 @@ def test_get_batch_padding_paths(monkeypatch):
     )()  # noqa: E501
     cfg.dataset = type("D", (), {"skip_getting_attention_mask_from_dataset": True})()
 
-    # Make batch shorter than 128 to trigger ceil-to-128 padding path
+    # The collate layer is now responsible for padding/truncation, so get_batch
+    # should preserve the incoming sequence length.
     short_tokens = torch.tensor([[1, 2, 3, 4]])
-    vi = Qwen2_5_VLVisualInputs(pixel_values=torch.randn(1, 1, 3, 4, 4), image_grid_thw=torch.tensor([[[1, 2, 2]]]))
+    vi = GenericVisualInputs(pixel_values=torch.randn(1, 1, 3, 4, 4), image_grid_thw=torch.tensor([[[1, 2, 2]]]))
     batch = {
         "input_ids": short_tokens,
         "labels": torch.tensor([[2, 3, 4, -100]]),
@@ -135,18 +427,155 @@ def test_get_batch_padding_paths(monkeypatch):
     # Iterator
     it = _Iterator(batch)
 
-    class _PG:
-        def __init__(self):
-            self.pp = object()
-
     tokens, labels, loss_mask, attention_mask, position_ids, *_ = get_batch(
-        it, cfg, use_mtp=False, pg_collection=_PG()
+        it, cfg, use_mtp=False, pg_collection=_MockPGCollection()
     )
-    # Length padded up to min(seq_cap, ceil_to_128(4)) == 32
-    assert tokens.shape[1] == 32
-    assert labels.shape[1] == 32
-    assert loss_mask.shape[1] == 32
-    assert position_ids.shape[1] == 32
+    assert tokens.shape[1] == 4
+    assert labels.shape[1] == 4
+    assert loss_mask.shape[1] == 4
+    assert position_ids.shape[1] == 4
+
+
+def test_get_batch_consumes_collated_packed_metadata(monkeypatch):
+    """Test get_batch with collate-provided packed-sequence metadata."""
+    # Simulate both first and last pipeline stages so tensors are returned
+    monkeypatch.setattr("megatron.core.pipeline_parallel.utils.is_pp_first_stage", lambda pg: True, raising=True)
+    monkeypatch.setattr("megatron.core.pipeline_parallel.utils.is_pp_last_stage", lambda pg: True, raising=True)
+
+    # Disable context parallel slicing effects
+    monkeypatch.setattr(
+        "megatron.core.utils.get_batch_on_this_cp_rank",
+        lambda x, **kwargs: x,
+        raising=True,
+    )
+
+    cfg = type("Cfg", (), {})()
+    cfg.model = type(
+        "M",
+        (),
+        {
+            "seq_length": 64,
+            "pipeline_model_parallel_size": 1,
+        },
+    )()
+    cfg.dataset = type(
+        "D",
+        (),
+        {
+            "skip_getting_attention_mask_from_dataset": True,
+            "enable_in_batch_packing": True,
+        },
+    )()
+
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+    labels = torch.tensor([[2, 3, -100, 5, 6, 7, 8, -100]])
+    loss_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0]])
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
+
+    vi = GenericVisualInputs(pixel_values=torch.randn(1, 1, 3, 4, 4), image_grid_thw=torch.tensor([[[1, 2, 2]]]))
+    batch = {
+        "input_ids": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "attention_mask": None,
+        "cu_seqlens_q": torch.tensor([0, 3, 8], dtype=torch.int32),
+        "cu_seqlens_kv": torch.tensor([0, 3, 8], dtype=torch.int32),
+        "max_seqlen_q": torch.tensor(5, dtype=torch.int32),
+        "max_seqlen_kv": torch.tensor(5, dtype=torch.int32),
+        "visual_inputs": vi,
+    }
+
+    it = _Iterator(batch)
+
+    (
+        out_tokens,
+        out_labels,
+        out_loss_mask,
+        out_attention_mask,
+        out_position_ids,
+        packed_seq_params,
+        visual_inputs,
+    ) = get_batch(it, cfg, use_mtp=False, pg_collection=_MockPGCollection())
+
+    assert out_tokens.shape == (1, 8)
+    assert out_labels.shape == (1, 8)
+    assert out_loss_mask.shape == (1, 8)
+    assert out_position_ids.shape == (1, 8)
+    assert packed_seq_params["cu_seqlens_q"].tolist() == [0, 3, 8]
+    assert packed_seq_params["cu_seqlens_kv"].tolist() == [0, 3, 8]
+    assert packed_seq_params["max_seqlen_q"].item() == 5
+    assert packed_seq_params["max_seqlen_kv"].item() == 5
+    assert "cu_seqlens_argmin" not in packed_seq_params
+    assert "cu_seqlens_unpadded" not in packed_seq_params
+    assert out_attention_mask is None
+    assert torch.equal(out_tokens.cpu(), tokens)
+    assert visual_inputs is not None
+
+
+def test_get_batch_consumes_current_padded_cu_seqlens(monkeypatch):
+    """Test get_batch forwards collate-provided current padded cu-seqlens fields."""
+    monkeypatch.setattr("megatron.core.pipeline_parallel.utils.is_pp_first_stage", lambda pg: True, raising=True)
+    monkeypatch.setattr("megatron.core.pipeline_parallel.utils.is_pp_last_stage", lambda pg: True, raising=True)
+    monkeypatch.setattr(
+        "megatron.core.utils.get_batch_on_this_cp_rank",
+        lambda x, **kwargs: x,
+        raising=True,
+    )
+
+    cfg = type("Cfg", (), {})()
+    cfg.model = type("M", (), {"seq_length": 64, "pipeline_model_parallel_size": 1})()
+    cfg.dataset = type(
+        "D",
+        (),
+        {
+            "skip_getting_attention_mask_from_dataset": True,
+            "enable_in_batch_packing": True,
+        },
+    )()
+
+    tokens = torch.tensor([[1, 2, 3, 0, 4, 5, 6, 7, 8, 0, 0, 0]])
+    labels = torch.full_like(tokens, -100)
+    loss_mask = torch.zeros_like(tokens, dtype=torch.float)
+    position_ids = torch.arange(12).unsqueeze(0)
+
+    batch = {
+        "input_ids": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "attention_mask": None,
+        "cu_seqlens_q": torch.tensor([0, 3, 8], dtype=torch.int32),
+        "cu_seqlens_kv": torch.tensor([0, 3, 8], dtype=torch.int32),
+        "cu_seqlens_q_padded": torch.tensor([0, 4, 12], dtype=torch.int32),
+        "cu_seqlens_kv_padded": torch.tensor([0, 4, 12], dtype=torch.int32),
+        "max_seqlen_q": torch.tensor(8, dtype=torch.int32),
+        "max_seqlen_kv": torch.tensor(8, dtype=torch.int32),
+        "visual_inputs": None,
+    }
+
+    it = _Iterator(batch)
+
+    (
+        out_tokens,
+        out_labels,
+        out_loss_mask,
+        _,
+        out_position_ids,
+        packed_seq_params,
+        _,
+    ) = get_batch(it, cfg, use_mtp=False, pg_collection=_MockPGCollection(cp_size=2))
+
+    assert out_tokens.shape[1] == 12
+    assert out_labels.shape[1] == 12
+    assert out_loss_mask.shape[1] == 12
+    assert out_position_ids.shape[1] == 12
+    assert packed_seq_params["cu_seqlens_q"].tolist() == [0, 3, 8]
+    assert packed_seq_params["cu_seqlens_kv"].tolist() == [0, 3, 8]
+    assert packed_seq_params["cu_seqlens_q_padded"].tolist() == [0, 4, 12]
+    assert packed_seq_params["cu_seqlens_kv_padded"].tolist() == [0, 4, 12]
+    assert packed_seq_params["max_seqlen_q"].item() == 8
+    assert packed_seq_params["max_seqlen_kv"].item() == 8
 
 
 def test_forward_step_schedule_plan(monkeypatch):
@@ -155,13 +584,32 @@ def test_forward_step_schedule_plan(monkeypatch):
     monkeypatch.setattr("megatron.core.pipeline_parallel.utils.is_pp_last_stage", lambda pg: True, raising=True)
 
     # No-op CUDA and CP functions
-    monkeypatch.setattr("megatron.core.utils.get_batch_on_this_cp_rank", lambda x: x, raising=True)
+    monkeypatch.setattr("megatron.core.utils.get_batch_on_this_cp_rank", lambda x, **kwargs: x, raising=True)
+
+    # Create a proper mock process group with rank/size methods
+    class _MockProcessGroup:
+        def rank(self):
+            return 0
+
+        def size(self):
+            return 1
+
+    # Create mock pg_collection with proper process groups
+    class _MockPGCollection:
+        def __init__(self):
+            self.pp = _MockProcessGroup()
+            self.tp = _MockProcessGroup()
+            self.cp = _MockProcessGroup()
 
     # Dummy model with required interface
     class _Model:
         def __init__(self):
             self.config = type("C", (), {"mtp_num_layers": 0, "overlap_moe_expert_parallel_comm": True})()
-            self.pg_collection = type("PG", (), {"pp": object()})()
+            self._pg_collection = _MockPGCollection()
+
+        @property
+        def pg_collection(self):
+            return self._pg_collection
 
         def build_schedule_plan(self, tokens, position_ids, attention_mask, labels=None, loss_mask=None):  # noqa: ARG002
             return torch.tensor(1)
@@ -208,7 +656,7 @@ def test_forward_step_schedule_plan(monkeypatch):
             self.straggler_timer = _Strag()
 
     # Reuse small iterator producing already-sized batch
-    vi = Qwen2_5_VLVisualInputs(pixel_values=torch.randn(1, 1, 3, 4, 4), image_grid_thw=torch.tensor([[[1, 2, 2]]]))
+    vi = GenericVisualInputs(pixel_values=torch.randn(1, 1, 3, 4, 4), image_grid_thw=torch.tensor([[[1, 2, 2]]]))
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
         "labels": torch.tensor([[2, 3, 4, -100]]),

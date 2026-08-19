@@ -20,12 +20,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from transformers import GenerationConfig
 
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.qwen.qwen3_next_bridge import Qwen3NextBridge
-from megatron.bridge.models.qwen.qwen_provider import Qwen3NextModelProvider
 
 
 class TestQwen3NextBridge:
@@ -81,6 +80,23 @@ class TestQwen3NextBridge:
         config = Mock()
         for key, value in qwen3_next_80b_a3b_config_dict.items():
             setattr(config, key, value)
+        # Explicitly set to None so hf_config_to_provider_kwargs skips them.
+        # Qwen3-Next is not an MLA model and not a DeepSeek-style MoE / MTP model.
+        for null_attr in (
+            # MLA attrs
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+            # Alternative MoE expert count attrs (would overwrite num_experts=512)
+            "n_routed_experts",
+            "num_local_experts",
+            # MTP attrs (not used by Qwen3-Next, but truthy in Mock)
+            "num_nextn_predict_layers",
+            "mtp_num_hidden_layers",
+        ):
+            setattr(config, null_attr, None)
         return config
 
     @pytest.fixture
@@ -88,7 +104,6 @@ class TestQwen3NextBridge:
         """Create a mock PreTrainedCausalLM with Qwen3 Next model."""
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_next_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
         mock_pretrained.model = Mock()
         mock_pretrained.model.dtype = torch.bfloat16
         return mock_pretrained
@@ -106,8 +121,8 @@ class TestQwen3NextBridge:
         # Call provider_bridge
         result = bridge.provider_bridge(mock_pretrained_qwen3_next)
 
-        # Check that it returns a Qwen3NextModelProvider instance
-        assert isinstance(result, Qwen3NextModelProvider)
+        # Check that it returns a GPTModelProvider instance (not a model-specific subclass)
+        assert isinstance(result, GPTModelProvider)
 
         # Check basic configuration mapping
         assert result.num_layers == mock_qwen3_next_config.num_hidden_layers
@@ -162,6 +177,32 @@ class TestQwen3NextBridge:
         assert result.linear_num_value_heads == mock_qwen3_next_config.linear_num_value_heads
         assert result.experimental_attention_variant == "gated_delta_net"
 
+    @pytest.mark.parametrize(
+        ("layer_types", "expected_pattern"),
+        [
+            (["linear_attention"] * 4, [1, 1, 1, 1]),
+            (
+                ["linear_attention", "full_attention", "linear_attention", "linear_attention"],
+                [1, 0, 1, 1],
+            ),
+        ],
+    )
+    def test_provider_bridge_preserves_explicit_layer_types(
+        self,
+        mock_pretrained_qwen3_next,
+        mock_qwen3_next_config,
+        layer_types,
+        expected_pattern,
+    ):
+        """Explicit Hugging Face layer schedules must survive config conversion."""
+        mock_qwen3_next_config.num_hidden_layers = len(layer_types)
+        mock_qwen3_next_config.full_attention_interval = None
+        mock_qwen3_next_config.layer_types = layer_types
+
+        result = Qwen3NextBridge().provider_bridge(mock_pretrained_qwen3_next)
+
+        assert result.linear_attention_freq == expected_pattern
+
     def test_provider_bridge_mlp_config(self, mock_pretrained_qwen3_next, mock_qwen3_next_config):
         """Test MLP configuration mapping."""
         bridge = Qwen3NextBridge()
@@ -214,7 +255,7 @@ class TestQwen3NextBridge:
         result = bridge.provider_bridge(mock_pretrained_qwen3_next)
 
         # Check MTP configuration
-        assert result.mtp_num_layers == 0
+        assert not result.mtp_num_layers
 
     def test_provider_bridge_dtype_handling(self, qwen3_next_80b_a3b_config_dict):
         """Test dtype handling in provider_bridge."""
@@ -222,11 +263,21 @@ class TestQwen3NextBridge:
         config = Mock()
         for key, value in qwen3_next_80b_a3b_config_dict.items():
             setattr(config, key, value)
+        for null_attr in (
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+            "n_routed_experts",
+            "num_local_experts",
+            "num_nextn_predict_layers",
+        ):
+            setattr(config, null_attr, None)
         config.torch_dtype = "bfloat16"
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3NextBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -243,22 +294,12 @@ class TestQwen3NextBridge:
         assert result.bf16 is False
         assert result.params_dtype == torch.float16
 
-    def test_provider_bridge_generation_config(self, mock_pretrained_qwen3_next):
-        """Test generation config mapping."""
-        bridge = Qwen3NextBridge()
-
-        result = bridge.provider_bridge(mock_pretrained_qwen3_next)
-
-        # Check that generation config is passed through
-        assert result.generation_config == mock_pretrained_qwen3_next.generation_config
-
     def test_provider_bridge_tie_word_embeddings_true(self, mock_qwen3_next_config):
         """Test provider_bridge with tie_word_embeddings=True."""
         mock_qwen3_next_config.tie_word_embeddings = True
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_next_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3NextBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -271,7 +312,6 @@ class TestQwen3NextBridge:
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_next_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3NextBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -286,7 +326,6 @@ class TestQwen3NextBridge:
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = mock_qwen3_next_config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3NextBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -299,10 +338,20 @@ class TestQwen3NextBridge:
         config = Mock()
         for key, value in qwen3_next_80b_a3b_config_dict.items():
             setattr(config, key, value)
+        for null_attr in (
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+            "n_routed_experts",
+            "num_local_experts",
+            "num_nextn_predict_layers",
+        ):
+            setattr(config, null_attr, None)
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = config
-        mock_pretrained.generation_config = Mock(spec=GenerationConfig)
 
         bridge = Qwen3NextBridge()
         result = bridge.provider_bridge(mock_pretrained)
@@ -451,3 +500,14 @@ class TestQwen3NextBridge:
             if "experts" in mapping.hf_param and "down_proj" in mapping.hf_param
         ]
         assert len(expert_down_params) > 0
+
+        # Sequential (non-grouped) expert mappings must be present for moe_grouped_gemm=False
+        # (e.g. ModelOpt pruning), for both the decoder and the MTP layers.
+        seq_params = [
+            getattr(m, "megatron_param", "")
+            for m in registry.mappings
+            if "experts.local_experts." in getattr(m, "megatron_param", "")
+        ]
+        assert any("decoder.layers" in p and p.endswith("linear_fc1.weight") for p in seq_params)
+        assert any("decoder.layers" in p and p.endswith("linear_fc2.weight") for p in seq_params)
+        assert any("mtp.layers" in p for p in seq_params)

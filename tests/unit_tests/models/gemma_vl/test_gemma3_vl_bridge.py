@@ -22,13 +22,16 @@ from transformers import GenerationConfig, SiglipVisionConfig
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.gemma_vl.gemma3_vl_bridge import Gemma3VLBridge
 from megatron.bridge.models.gemma_vl.gemma3_vl_provider import Gemma3VLModelProvider
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
 @pytest.fixture
 def mock_text_config():
     """Create a mock text config for Gemma3 VL."""
-    config = Mock()
+    # Use spec=[] so hasattr() only returns True for explicitly-set attributes,
+    # matching real HF config behaviour (Gemma3 text config has no MLA fields
+    # like q_lora_rank, so they must not appear in the provider kwargs).
+    config = Mock(spec=[])
     config.num_hidden_layers = 28
     config.hidden_size = 2560
     config.intermediate_size = 15360
@@ -44,6 +47,9 @@ def mock_text_config():
     config.rope_theta = 1000000.0
     config.query_pre_attn_scalar = 256
     config.rope_scaling = None
+    config.rope_parameters = None
+    config.hidden_act = "gelu_pytorch_tanh"
+    config.torch_dtype = "bfloat16"
     return config
 
 
@@ -81,7 +87,7 @@ def mock_hf_config(mock_text_config, mock_vision_config):
 @pytest.fixture
 def mock_hf_pretrained(mock_hf_config):
     """Create a mock HF pretrained VLM."""
-    pretrained = Mock(spec=PreTrainedVLM)
+    pretrained = Mock(spec=PreTrainedCausalLM)
     pretrained.config = mock_hf_config
     pretrained.generation_config = GenerationConfig()
     return pretrained
@@ -91,22 +97,6 @@ def mock_hf_pretrained(mock_hf_config):
 def gemma3_vl_bridge():
     """Create a Gemma3VLBridge instance."""
     return Gemma3VLBridge()
-
-
-class TestGemma3VLBridgeInitialization:
-    """Test Gemma3VLBridge initialization and basic functionality."""
-
-    def test_bridge_initialization(self, gemma3_vl_bridge):
-        """Test that bridge can be initialized."""
-        assert isinstance(gemma3_vl_bridge, Gemma3VLBridge)
-
-    def test_bridge_has_required_methods(self, gemma3_vl_bridge):
-        """Test that bridge has required methods."""
-        assert hasattr(gemma3_vl_bridge, "provider_bridge")
-        assert callable(gemma3_vl_bridge.provider_bridge)
-
-        assert hasattr(gemma3_vl_bridge, "mapping_registry")
-        assert callable(gemma3_vl_bridge.mapping_registry)
 
 
 class TestGemma3VLBridgeProviderBridge:
@@ -160,6 +150,7 @@ class TestGemma3VLBridgeProviderBridge:
 
         # Check vision config
         assert isinstance(provider.vision_config, SiglipVisionConfig)
+        assert provider.vision_config.vision_use_head is False
         assert provider.mm_tokens_per_image == 256
 
     def test_provider_bridge_vision_projector_config(self, gemma3_vl_bridge, mock_hf_pretrained):
@@ -195,7 +186,7 @@ class TestGemma3VLBridgeProviderBridge:
 
         # Should use defaults
         assert provider.vision_start_token_id == 255999
-        assert provider.image_token_id == 151655  # Default from bridge
+        assert provider.image_token_id == 262144  # Default from bridge
 
     def test_provider_bridge_with_rope_scaling(self, gemma3_vl_bridge, mock_hf_pretrained):
         """Test provider_bridge with RoPE scaling configuration."""
@@ -206,38 +197,13 @@ class TestGemma3VLBridgeProviderBridge:
 
         assert provider.rope_scaling_factor == 2.0
 
-    @patch.object(Gemma3VLBridge, "dtype_from_hf")
-    def test_provider_bridge_dtype_handling(self, mock_dtype_from_hf, gemma3_vl_bridge, mock_hf_pretrained):
-        """Test provider_bridge handles dtype correctly."""
-        mock_dtype_from_hf.return_value = torch.float16
-
+    def test_provider_bridge_hardcoded_bf16(self, gemma3_vl_bridge, mock_hf_pretrained):
+        """Test provider_bridge hardcodes bf16 dtype."""
         provider = gemma3_vl_bridge.provider_bridge(mock_hf_pretrained)
 
-        assert provider.fp16 is True
-        assert provider.bf16 is False
-        assert provider.params_dtype == torch.float16
-
-    @patch.object(Gemma3VLBridge, "dtype_from_hf")
-    def test_provider_bridge_bfloat16_handling(self, mock_dtype_from_hf, gemma3_vl_bridge, mock_hf_pretrained):
-        """Test provider_bridge handles bfloat16 correctly."""
-        mock_dtype_from_hf.return_value = torch.bfloat16
-
-        provider = gemma3_vl_bridge.provider_bridge(mock_hf_pretrained)
-
-        assert provider.fp16 is False
+        # Gemma3VL bridge hardcodes bf16 to match baseline
         assert provider.bf16 is True
         assert provider.params_dtype == torch.bfloat16
-
-    @patch.object(Gemma3VLBridge, "dtype_from_hf")
-    def test_provider_bridge_float32_handling(self, mock_dtype_from_hf, gemma3_vl_bridge, mock_hf_pretrained):
-        """Test provider_bridge handles float32 correctly."""
-        mock_dtype_from_hf.return_value = torch.float32
-
-        provider = gemma3_vl_bridge.provider_bridge(mock_hf_pretrained)
-
-        assert provider.fp16 is False
-        assert provider.bf16 is False
-        assert provider.params_dtype == torch.float32
 
 
 class TestGemma3VLBridgeMappingRegistry:
@@ -282,20 +248,110 @@ class TestGemma3VLBridgeMappingRegistry:
         """Test mapping_registry handles vision tower parameters correctly."""
         registry = gemma3_vl_bridge.mapping_registry()
 
-        # Should contain vision tower parameter mappings
-        mappings = registry.mappings
-        mapping_names = []
-        for mapping in mappings:
-            if hasattr(mapping, "megatron_param"):
-                mapping_names.append(str(getattr(mapping, "megatron_param")))
-            hf = getattr(mapping, "hf_param", None)
-            if isinstance(hf, dict):
-                mapping_names.extend([str(v) for v in hf.values()])
-            elif isinstance(hf, str):
-                mapping_names.append(hf)
+        # Find the ReplicatedMapping for vision_tower
+        from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
 
-        has_vision_tower = any("vision_tower" in name for name in mapping_names)
-        assert has_vision_tower, "Should contain vision tower parameter mappings"
+        vision_mappings = [
+            m
+            for m in registry.mappings
+            if isinstance(m, ReplicatedMapping) and "vision_tower" in str(getattr(m, "megatron_param", ""))
+        ]
+        assert len(vision_mappings) == 1, "Should have exactly one ReplicatedMapping for vision_tower"
+
+        vt_mapping = vision_mappings[0]
+        assert str(vt_mapping.megatron_param) == "vision_tower.**", "Megatron vision_tower param should use wildcard"
+        assert str(vt_mapping.hf_param) == "vision_tower.**", (
+            "HF param must match the current Gemma3 checkpoint namespace"
+        )
+
+    def test_mapping_registry_accepts_current_transformers_vision_tower_keys(self, gemma3_vl_bridge):
+        """Test mapping_registry accepts current transformers Gemma3 vision tower keys."""
+        registry = gemma3_vl_bridge.mapping_registry()
+
+        mapping = registry.hf_to_megatron_lookup("vision_tower.embeddings.patch_embedding.bias")
+
+        assert mapping is not None
+        assert str(mapping.megatron_param) == "vision_tower.embeddings.patch_embedding.bias"
+        assert str(mapping.hf_param) == "vision_tower.embeddings.patch_embedding.bias"
+
+    def test_mapping_registry_accepts_legacy_checkpoint_vision_tower_keys(self, gemma3_vl_bridge):
+        """Test mapping_registry preserves the nested namespace in legacy Gemma3 checkpoints."""
+        gemma3_vl_bridge.hf_pretrained = Mock()
+        gemma3_vl_bridge.hf_pretrained.state.source.get_all_keys.return_value = {
+            "vision_tower.vision_model.embeddings.patch_embedding.bias",
+        }
+
+        registry = gemma3_vl_bridge.mapping_registry()
+        mapping = registry.hf_to_megatron_lookup("vision_tower.vision_model.embeddings.patch_embedding.bias")
+
+        assert mapping is not None
+        assert str(mapping.megatron_param) == "vision_tower.embeddings.patch_embedding.bias"
+        assert str(mapping.hf_param) == "vision_tower.vision_model.embeddings.patch_embedding.bias"
+
+        export_mapping = registry.megatron_to_hf_lookup("vision_tower.embeddings.patch_embedding.bias")
+
+        assert export_mapping is not None
+        assert str(export_mapping.megatron_param) == "vision_tower.embeddings.patch_embedding.bias"
+        assert str(export_mapping.hf_param) == "vision_tower.vision_model.embeddings.patch_embedding.bias"
+
+    def test_build_conversion_tasks_preserves_legacy_vision_tower_owner(self, gemma3_vl_bridge):
+        """Test legacy HF keys do not turn the owning PP task into a receiver-only task."""
+        megatron_name = "vision_tower.embeddings.patch_embedding.bias"
+        legacy_hf_name = "vision_tower.vision_model.embeddings.patch_embedding.bias"
+        weight = torch.nn.Parameter(torch.ones(2))
+        module = Mock()
+        model = Mock()
+        model.config = Mock()
+        model.named_parameters.return_value = [(megatron_name, weight)]
+
+        hf_pretrained = Mock()
+        hf_pretrained.config = Mock()
+        hf_pretrained.state.source.get_all_keys.return_value = {legacy_hf_name}
+
+        with (
+            patch(
+                "megatron.bridge.models.conversion.model_bridge.unwrap_model",
+                return_value=[model],
+            ),
+            patch(
+                "megatron.bridge.models.conversion.model_bridge.persistent_buffers",
+                return_value=[],
+            ),
+            patch(
+                "megatron.bridge.models.conversion.model_bridge._get_pg_collection_from_model",
+                return_value=None,
+            ),
+            patch(
+                "megatron.bridge.models.conversion.model_bridge._get_pp_rank",
+                return_value=0,
+            ),
+            patch(
+                "megatron.bridge.models.conversion.model_bridge._megatron_local_name_to_global",
+                return_value=megatron_name,
+            ),
+            patch(
+                "megatron.bridge.models.conversion.model_bridge.get_module_and_param_from_name",
+                return_value=(module, weight),
+            ),
+            patch.object(
+                gemma3_vl_bridge,
+                "_megatron_global_param_names_all_pp_ranks",
+                return_value=[megatron_name],
+            ),
+            patch.object(
+                gemma3_vl_bridge,
+                "_share_embeddings_and_output_weights",
+                return_value=False,
+            ),
+        ):
+            tasks = gemma3_vl_bridge.build_conversion_tasks(hf_pretrained, [model])
+
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task is not None
+        assert task.param_weight is weight
+        assert task.megatron_module is module
+        assert str(task.mapping.hf_param) == legacy_hf_name
 
     def test_mapping_registry_multimodal_projector_params(self, gemma3_vl_bridge):
         """Test mapping_registry handles multimodal projector parameters correctly."""
@@ -379,11 +435,11 @@ class TestGemma3VLBridgeEdgeCases:
 
     def test_provider_bridge_with_minimal_config(self, gemma3_vl_bridge):
         """Test provider_bridge with minimal HF config."""
-        minimal_pretrained = Mock(spec=PreTrainedVLM)
+        minimal_pretrained = Mock(spec=PreTrainedCausalLM)
         minimal_config = Mock()
 
         # Create minimal text config
-        text_config = Mock()
+        text_config = Mock(spec=[])
         text_config.num_hidden_layers = 18
         text_config.hidden_size = 2048
         text_config.intermediate_size = 8192
@@ -399,6 +455,9 @@ class TestGemma3VLBridgeEdgeCases:
         text_config.rope_theta = 1000000.0
         text_config.query_pre_attn_scalar = 256
         text_config.rope_scaling = None
+        text_config.rope_parameters = None
+        text_config.hidden_act = "gelu_pytorch_tanh"
+        text_config.torch_dtype = "bfloat16"
 
         # Create minimal vision config
         vision_config = SiglipVisionConfig()

@@ -20,7 +20,7 @@ import torch
 
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.gpt_oss.gpt_oss_bridge import GPTOSSBridge
-from megatron.bridge.models.gpt_oss.gpt_oss_provider import GPTOSSProvider
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
@@ -38,11 +38,15 @@ class TestGptOssBridge:
             "num_local_experts": 32,
             "torch_dtype": "bfloat16",
             "vocab_size": 201088,
+            "hidden_act": "silu",
+            "sliding_window": 4096,
+            "attention_bias": True,
         }
 
     @pytest.fixture
     def mock_pretrained(self, gpt_oss_cfg):
-        cfg = Mock()
+        # Use spec to prevent Mock from auto-creating undefined attributes
+        cfg = Mock(spec=list(gpt_oss_cfg.keys()))
         for k, v in gpt_oss_cfg.items():
             setattr(cfg, k, v)
 
@@ -57,10 +61,19 @@ class TestGptOssBridge:
     def test_provider_bridge_maps_config(self, mock_pretrained):
         bridge = GPTOSSBridge()
         provider = bridge.provider_bridge(mock_pretrained)
-        assert isinstance(provider, GPTOSSProvider)
+        assert isinstance(provider, GPTModelProvider)
         # Key fields mapped from HF config
         assert provider.num_layers == mock_pretrained.config.num_hidden_layers
         assert provider.num_moe_experts == mock_pretrained.config.num_local_experts
+        assert provider.add_qkv_bias == mock_pretrained.config.attention_bias
         # dtype mapping
         assert provider.bf16 is True
         assert provider.params_dtype == torch.bfloat16
+
+    def test_megatron_to_hf_config_preserves_attention_bias(self, mock_pretrained):
+        bridge = GPTOSSBridge()
+        provider = bridge.provider_bridge(mock_pretrained)
+
+        hf_config = bridge.megatron_to_hf_config(provider)
+
+        assert hf_config["attention_bias"] is True
