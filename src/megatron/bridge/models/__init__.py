@@ -13,6 +13,11 @@
 # limitations under the License.
 
 # Import model providers for easy access
+from megatron.bridge.models.apertus import (
+    ApertusBridge,
+    ApertusModelProvider,
+    ApertusModelProvider8B,
+)
 from megatron.bridge.models.bailing import (
     BailingMoeV2Bridge,
 )
@@ -27,11 +32,6 @@ from megatron.bridge.models.conversion.param_mapping import (
     QKVMapping,
     ReplicatedMapping,
     RowParallelMapping,
-)
-from megatron.bridge.models.apertus import (
-    ApertusBridge,
-    ApertusModelProvider,
-    ApertusModelProvider8B,
 )
 from megatron.bridge.models.deepseek import (
     DeepSeekV2Bridge,

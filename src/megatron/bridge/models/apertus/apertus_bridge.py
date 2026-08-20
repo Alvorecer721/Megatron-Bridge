@@ -29,6 +29,7 @@ from typing import Dict, Mapping
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
 
+from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import (
     MegatronModelBridge,
@@ -43,12 +44,9 @@ from megatron.bridge.models.conversion.transformers_compat import (
     rope_theta_from_hf,
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider
 
 
-@MegatronModelBridge.register_bridge(
-    source="ApertusForCausalLM", target=GPTModel, model_type="apertus"
-)
+@MegatronModelBridge.register_bridge(source="ApertusForCausalLM", target=GPTModel, model_type="apertus")
 class ApertusBridge(MegatronModelBridge):
     """
     Megatron Bridge for Apertus Causal LM.
@@ -70,9 +68,7 @@ class ApertusBridge(MegatronModelBridge):
     # generic builder-backed GPT config cannot represent that wiring yet.
     MODEL_CONFIG_CLASS = None
 
-    def provider_bridge(
-        self, hf_pretrained: PreTrainedCausalLM
-    ) -> ApertusModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
         hf_config = hf_pretrained.config
 
         # theta + factor via the shared v4/v5 compat helpers; rope_type and the
@@ -80,16 +76,10 @@ class ApertusBridge(MegatronModelBridge):
         # dict (rope_parameters in transformers >=5.0, rope_scaling before).
         rotary_base = rope_theta_from_hf(hf_config)
         rope_scaling_factor = rope_scaling_factor_from_hf(hf_config, default=1.0)
-        rope_dict = (
-            getattr(hf_config, "rope_parameters", None)
-            or getattr(hf_config, "rope_scaling", None)
-            or {}
-        )
+        rope_dict = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
         rope_type = rope_dict.get("rope_type", rope_dict.get("type", "default"))
         if rope_type not in ("default", "llama3"):
-            raise ValueError(
-                f"Unsupported rope_type {rope_type!r} for Apertus (expected default or llama3)."
-            )
+            raise ValueError(f"Unsupported rope_type {rope_type!r} for Apertus (expected default or llama3).")
         rope_scaling = rope_type == "llama3"
         if rope_scaling:
             # mcore's native llama3 scaling hardcodes these — validate the HF
@@ -99,11 +89,7 @@ class ApertusBridge(MegatronModelBridge):
                 "high_freq_factor": 4.0,
                 "original_max_position_embeddings": 8192,
             }
-            mismatched = {
-                k: rope_dict.get(k, v)
-                for k, v in fixed.items()
-                if rope_dict.get(k, v) != v
-            }
+            mismatched = {k: rope_dict.get(k, v) for k, v in fixed.items() if rope_dict.get(k, v) != v}
             if mismatched:
                 raise ValueError(
                     f"Apertus rope_scaling has non-default llama3 parameters {mismatched}; "
@@ -131,18 +117,10 @@ class ApertusBridge(MegatronModelBridge):
             # RoPE scaling (native mcore llama3 passthrough, validated above)
             rope_scaling=rope_scaling,
             rope_scaling_factor=rope_scaling_factor,
-            make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(
-                hf_config.vocab_size
-            ),
-            share_embeddings_and_output_weights=getattr(
-                hf_config, "tie_word_embeddings", False
-            ),
-            fp16=(
-                self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16
-            ),
-            bf16=(
-                self.dtype_from_hf(hf_config, default=torch.float32) == torch.bfloat16
-            ),
+            make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(hf_config.vocab_size),
+            share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
+            fp16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16),
+            bf16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.bfloat16),
             params_dtype=self.dtype_from_hf(hf_config, default=torch.float32),
             vocab_size=hf_config.vocab_size,
         )
@@ -187,9 +165,7 @@ class ApertusBridge(MegatronModelBridge):
 
         mapping_list = []
         for megatron_param, hf_param in param_mappings.items():
-            mapping_list.append(
-                AutoMapping(megatron_param=megatron_param, hf_param=hf_param)
-            )
+            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
 
         # Add QKV mapping (combine separate Q, K, V into single QKV matrix)
         mapping_list.append(
@@ -217,9 +193,7 @@ class ApertusBridge(MegatronModelBridge):
         disk-load the HF checkpoint to recover them.
         """
         module = task.megatron_module
-        if module is not None and task.global_param_name.endswith(
-            "mlp.activation_func.alpha_p"
-        ):
+        if module is not None and task.global_param_name.endswith("mlp.activation_func.alpha_p"):
             hf_alpha = next(k for k in converted_weights_dict if k.endswith(".alpha_p"))
             hf_prefix = hf_alpha[: -len("alpha_p")]
             alpha = converted_weights_dict[hf_alpha]

@@ -159,9 +159,7 @@ def _should_load_checkpoint(cfg: ConfigContainer, checkpoint_manager: Checkpoint
         "local_checkpoint_manager" in checkpointing_context
         and checkpointing_context["local_checkpoint_manager"].find_latest() != -1
     )
-    has_global_non_persistent_checkpoint = _has_global_non_persistent_checkpoint(
-        cfg.checkpoint.load, cfg.checkpoint
-    )
+    has_global_non_persistent_checkpoint = _has_global_non_persistent_checkpoint(cfg.checkpoint.load, cfg.checkpoint)
 
     if cfg.peft is not None:
         load_checkpoint_exists = cfg.checkpoint.load is not None and (
@@ -388,9 +386,7 @@ def setup(
                 checkpoint_path = cfg.checkpoint.pretrained_checkpoint
                 ckpt_step = None
             else:
-                raise RuntimeError(
-                    "No checkpoint source is available for ModelOpt state restoration"
-                )
+                raise RuntimeError("No checkpoint source is available for ModelOpt state restoration")
 
             if not has_modelopt_state(checkpoint_path, ckpt_step=ckpt_step):
                 raise RuntimeError(f"No modelopt_state found in selected checkpoint={checkpoint_path}")
@@ -573,7 +569,9 @@ def _register_setup_pre_wrap_hook(
             ]
         else:
             model_cfg._pre_wrap_hooks[:] = [
-                registered_hook for registered_hook in model_cfg._pre_wrap_hooks if registered_hook is not previous_hook
+                registered_hook
+                for registered_hook in model_cfg._pre_wrap_hooks
+                if registered_hook is not previous_hook
             ]
 
     setup_hooks[setup_hook_name] = hook
