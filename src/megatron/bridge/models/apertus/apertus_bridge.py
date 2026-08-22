@@ -24,8 +24,6 @@ Runs on stock megatron-core:
     >>> bridge = AutoBridge.from_hf_pretrained("swiss-ai/Apertus-8B-2509")
 """
 
-from typing import Dict, Mapping
-
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -33,7 +31,6 @@ from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import (
     MegatronModelBridge,
-    WeightConversionTask,
 )
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
@@ -179,28 +176,3 @@ class ApertusBridge(MegatronModelBridge):
         # Note: No GatedMLPMapping - Apertus uses simple up_proj + XIELU, not gate_proj * up_proj
 
         return MegatronMappingRegistry(*mapping_list)
-
-    def maybe_modify_converted_hf_weight(
-        self,
-        task: WeightConversionTask,
-        converted_weights_dict: Dict[str, torch.Tensor],
-        hf_state_dict: Mapping[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """Emit xIELU beta/eps as HF buffers so the refit carries them (lets vLLM dummy-load).
-
-        beta/eps are Python-float constants on the Bridge XIELU (not params/buffers), so they
-        are absent from the Megatron state_dict and the export tasks — without this, vLLM must
-        disk-load the HF checkpoint to recover them.
-        """
-        module = task.megatron_module
-        if module is not None and task.global_param_name.endswith("mlp.activation_func.alpha_p"):
-            hf_alpha = next(k for k in converted_weights_dict if k.endswith(".alpha_p"))
-            hf_prefix = hf_alpha[: -len("alpha_p")]
-            alpha = converted_weights_dict[hf_alpha]
-            converted_weights_dict[hf_prefix + "beta"] = torch.tensor(
-                module.beta, dtype=alpha.dtype, device=alpha.device
-            )
-            converted_weights_dict[hf_prefix + "eps"] = torch.tensor(
-                module.eps, dtype=alpha.dtype, device=alpha.device
-            )
-        return converted_weights_dict
