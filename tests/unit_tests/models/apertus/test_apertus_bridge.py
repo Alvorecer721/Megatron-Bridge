@@ -14,7 +14,10 @@
 
 import pytest
 
-from megatron.bridge.models.apertus.apertus_bridge import ApertusBridge
+from megatron.bridge.models.apertus.apertus_bridge import (
+    APERTUS_XIELU_STATIC_STATE_OWNER,
+    ApertusBridge,
+)
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 
 
@@ -23,4 +26,5 @@ pytestmark = pytest.mark.unit
 
 def test_apertus_export_does_not_synthesize_architecture_constants() -> None:
     """Refit exports trained tensors; xIELU beta/eps stay engine-owned."""
+    assert APERTUS_XIELU_STATIC_STATE_OWNER == "engine"
     assert ApertusBridge.maybe_modify_converted_hf_weight is MegatronModelBridge.maybe_modify_converted_hf_weight

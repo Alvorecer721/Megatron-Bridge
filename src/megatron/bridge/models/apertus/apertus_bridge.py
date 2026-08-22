@@ -43,6 +43,9 @@ from megatron.bridge.models.conversion.transformers_compat import (
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
+APERTUS_XIELU_STATIC_STATE_OWNER = "engine"
+
+
 @MegatronModelBridge.register_bridge(source="ApertusForCausalLM", target=GPTModel, model_type="apertus")
 class ApertusBridge(MegatronModelBridge):
     """
