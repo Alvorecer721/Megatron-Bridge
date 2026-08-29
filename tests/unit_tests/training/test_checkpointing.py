@@ -579,6 +579,7 @@ def save_checkpoint_fixtures():
     mock_cfg.checkpoint.save_optim = True
     mock_cfg.checkpoint.save_rng = True
     mock_cfg.checkpoint.ckpt_format = "torch_dist"
+    mock_cfg.checkpoint.ckpt_load_validate_sharding_integrity = True
     mock_cfg.checkpoint.non_persistent_ckpt_type = "global"
     mock_cfg.checkpoint.save_tokenizer_assets = False  # Disable for unit tests
     mock_cfg.checkpoint.also_save_hf_checkpoint = False
@@ -756,22 +757,35 @@ class TestSaveCheckpoint:
         save_checkpoint_fixtures["mock_state"].wandb_logger = Mock()
         save_checkpoint_fixtures["mock_state"].cfg.checkpoint.most_recent_k = -1
         save_checkpoint_fixtures["mock_state"].cfg.checkpoint.save_rng = save_rng
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.ckpt_load_validate_sharding_integrity = False
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.fully_parallel_save = True
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.ckpt_assume_constant_structure = False
 
         # Call save_checkpoint
-        save_checkpoint(
-            save_checkpoint_fixtures["mock_state"],
-            save_checkpoint_fixtures["mock_model"],
-            save_checkpoint_fixtures["mock_optimizer"],
-            save_checkpoint_fixtures["mock_scheduler"],
-            1000000,
-            checkpointing_context={},
-            non_persistent_ckpt=False,
-        )
+        with patch(
+            "megatron.bridge.training.checkpointing.FullyParallelSaveStrategyWrapper"
+        ) as mock_fully_parallel_wrapper:
+            save_checkpoint(
+                save_checkpoint_fixtures["mock_state"],
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+                non_persistent_ckpt=False,
+            )
 
         # Verify calls
         mock_ft.on_checkpointing_start.assert_called_once()
         mock_gen_state.assert_called_once()
+        mock_fully_parallel_wrapper.assert_called_once_with(
+            mock_strategy_cls.return_value,
+            mock_pg_collection.dp_cp,
+            False,
+            validate_access_integrity=False,
+        )
         mock_dist_ckpt.save.assert_called_once()
+        assert mock_dist_ckpt.save.call_args.kwargs["validate_access_integrity"] is False
         if save_rng:
             mock_get_rng.assert_called_once()
         else:
@@ -4405,9 +4419,10 @@ class TestCheckpointPathOverride:
         mock_pg.dp_cp = Mock()
 
         sharded_sd = {"weight": "placeholder"}
+        checkpoint_config = CheckpointConfig(ckpt_load_validate_sharding_integrity=False)
         state_dict, checkpoint_name, release, ckpt_type = _load_global_dist_base_checkpoint(
             load_dir="/should/not/be/used",
-            ckpt_cfg=CheckpointConfig(),
+            ckpt_cfg=checkpoint_config,
             rank0=False,
             sharded_state_dict=sharded_sd,
             iteration=None,
@@ -4421,6 +4436,7 @@ class TestCheckpointPathOverride:
         mock_dist_ckpt.load.assert_called_once()
         load_call_args = mock_dist_ckpt.load.call_args
         assert load_call_args[0][1] == "/direct/iter_0001000"
+        assert load_call_args.kwargs["validate_access_integrity"] is False
 
     @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", True)
     def test_load_fsdp_dtensor_uses_override_rank0(self):
