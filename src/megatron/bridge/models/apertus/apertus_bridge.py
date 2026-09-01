@@ -1,169 +1,181 @@
-from __future__ import annotations
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Apertus Model Bridge for converting between HuggingFace and Megatron formats.
+
+Apertus is a Swiss AI model based on Llama architecture with:
+- XIELU activation (learnable alpha_p, alpha_n parameters)
+- QK normalization
+- Llama3-style RoPE scaling
+
+Runs on stock megatron-core:
+    >>> from megatron.bridge import AutoBridge
+    >>> bridge = AutoBridge.from_hf_pretrained("swiss-ai/Apertus-8B-2509")
+"""
 
 import torch
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.transformer.spec_utils import get_submodules
-from megatron.core.utils import is_torch_min_version
-from transformers import ApertusForCausalLM
-from transformers.activations import XIELUActivation
 
+from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.model_bridge import (
+    MegatronModelBridge,
+)
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
-    ColumnParallelMapping,
     QKVMapping,
-    ReplicatedMapping,
 )
-from megatron.bridge.models.conversion.utils import unwrap_model
-
-_ROPE_DEFAULTS = {
-    "rope_type": "llama3",
-    "original_max_position_embeddings": 8192,
-    "low_freq_factor": 1.0,
-    "high_freq_factor": 4.0,
-}
+from megatron.bridge.models.conversion.transformers_compat import (
+    rope_scaling_factor_from_hf,
+    rope_theta_from_hf,
+)
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
-class MCoreXIELU(XIELUActivation):
-    def __init__(self, *, config):
-        super().__init__(dtype=config.params_dtype, with_vector_loads=False)
-        if self._xielu_cuda_obj is None:
-            raise RuntimeError("CUDA xIELU is required. Install rubber-duck-debug/xielu.")
-        self.to(
-            device=torch.device("cpu")
-            if getattr(config, "use_cpu_initialization", False)
-            else torch.device("cuda", torch.cuda.current_device())
-        )
-        self.alpha_p.sum_gradients_across_tp_domain = True
-        self.alpha_n.sum_gradients_across_tp_domain = True
-        self._sync_runtime_scalars()
-        self.register_load_state_dict_post_hook(lambda m, _: m._sync_runtime_scalars())
-
-    @torch.no_grad()
-    def _sync_runtime_scalars(self):
-        """Refresh CUDA-kernel host caches after beta/eps buffers change."""
-        if getattr(self.beta, "is_meta", False) or getattr(self.eps, "is_meta", False):
-            return
-        self._beta_scalar = float(self.beta.detach().cpu().float().item())
-        self._eps_scalar = float(self.eps.detach().cpu().float().item())
+APERTUS_XIELU_STATIC_STATE_OWNER = "engine"
 
 
-def get_apertus_decoder_block_spec(config, vp_stage=None, pp_rank=None):
-    assert is_torch_min_version("2.4.0a0"), "Torch RMSNorm requires PyTorch >= 2.4"
-    block_spec = get_gpt_decoder_block_spec(
-        config, use_transformer_engine=True, normalization="RMSNorm", vp_stage=vp_stage, pp_rank=pp_rank
-    )
-    for layer in block_spec.layer_specs:
-        attn = layer.submodules.self_attention.submodules
-        attn.q_layernorm = attn.k_layernorm = (lambda config, hidden_size, eps=1e-5, **_: torch.nn.RMSNorm(hidden_size, eps=eps))
-        get_submodules(layer.submodules.mlp).activation_func = MCoreXIELU
-    return block_spec
-
-
-@MegatronModelBridge.register_bridge(source=ApertusForCausalLM, target=GPTModel, model_type="apertus")
+@MegatronModelBridge.register_bridge(source="ApertusForCausalLM", target=GPTModel, model_type="apertus")
 class ApertusBridge(MegatronModelBridge):
-    @classmethod
-    def hf_to_megatron_activation(cls, hidden_act: str):
-        if hidden_act != "xielu":
-            return super().hf_to_megatron_activation(hidden_act)
-        return lambda _: (_ for _ in ()).throw(RuntimeError("expected MCoreXIELU"))
+    """
+    Megatron Bridge for Apertus Causal LM.
 
-    def provider_bridge(self, hf_pretrained):
-        provider = super().provider_bridge(hf_pretrained)
-        config = hf_pretrained.config
-        rope = {**(getattr(config, "rope_scaling", None) or {}), **(getattr(config, "rope_parameters", None) or {})}
-        rope_type = rope.get("rope_type", rope.get("type", "llama3"))
-        factor = float(rope.get("factor", 1.0))
-        theta = float(rope.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
-        if config.hidden_act != "xielu":
-            raise ValueError(f"Expected hidden_act='xielu', got {config.hidden_act!r}")
-        if config.attention_bias:
-            raise ValueError("Apertus attention_bias=True is unsupported")
-        if rope_type != "llama3":
-            raise ValueError(f"Unsupported Apertus RoPE type: {rope_type!r}")
+    Converts between HuggingFace swiss-ai/Apertus-8B and Megatron GPT format.
 
-        provider.apertus_rope_scaling = {
-            "rope_type": rope_type,
-            "type": rope_type,
-            "factor": factor,
-            "original_max_position_embeddings": int(rope.get("original_max_position_embeddings", 8192)),
-            "low_freq_factor": float(rope.get("low_freq_factor", 1.0)),
-            "high_freq_factor": float(rope.get("high_freq_factor", 4.0)),
-        }
-        provider.normalization = "RMSNorm"
-        provider.qk_layernorm = True
-        provider.gated_linear_unit = False
-        provider.use_te_activation_func = False
-        provider.bias_activation_fusion = False
-        provider.add_bias_linear = False
-        provider.add_qkv_bias = False
-        provider.hidden_dropout = 0.0
-        provider.rotary_interleaved = False
-        provider.position_embedding_type = "rope"
-        provider.rotary_base = theta
-        provider.rope_scaling = True
-        provider.rope_scaling_factor = factor
-        provider.transformer_layer_spec = get_apertus_decoder_block_spec
+    Key differences from LlamaBridge:
+    - Maps XIELU activation parameters (alpha_p, alpha_n)
+    - Enables QK normalization
+    - Uses Llama3-style RoPE scaling
+
+    Example:
+        >>> from megatron.bridge import AutoBridge
+        >>> bridge = AutoBridge.from_hf_pretrained("swiss-ai/Apertus-8B-2509")
+        >>> provider = bridge.to_megatron_provider()
+    """
+
+    # Apertus needs a custom provider to install its XIELU layer spec. The
+    # generic builder-backed GPT config cannot represent that wiring yet.
+    MODEL_CONFIG_CLASS = None
+
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
+        hf_config = hf_pretrained.config
+
+        # theta + factor via the shared v4/v5 compat helpers; rope_type and the
+        # llama3 sub-params are not exposed by the helpers, so read the raw
+        # dict (rope_parameters in transformers >=5.0, rope_scaling before).
+        rotary_base = rope_theta_from_hf(hf_config)
+        rope_scaling_factor = rope_scaling_factor_from_hf(hf_config, default=1.0)
+        rope_dict = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
+        rope_type = rope_dict.get("rope_type", rope_dict.get("type", "default"))
+        if rope_type not in ("default", "llama3"):
+            raise ValueError(f"Unsupported rope_type {rope_type!r} for Apertus (expected default or llama3).")
+        rope_scaling = rope_type == "llama3"
+        if rope_scaling:
+            # mcore's native llama3 scaling hardcodes these — validate the HF
+            # config matches before silently building a different model.
+            fixed = {
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            }
+            mismatched = {k: rope_dict.get(k, v) for k, v in fixed.items() if rope_dict.get(k, v) != v}
+            if mismatched:
+                raise ValueError(
+                    f"Apertus rope_scaling has non-default llama3 parameters {mismatched}; "
+                    f"mcore's native rope scaling hardcodes {fixed} and would silently "
+                    "build a different model."
+                )
+
+        # Extract kv_channels from head_dim if present
+        kv_channels = getattr(hf_config, "head_dim", None)
+
+        provider = ApertusModelProvider(
+            num_layers=hf_config.num_hidden_layers,
+            hidden_size=hf_config.hidden_size,
+            ffn_hidden_size=hf_config.intermediate_size,
+            num_attention_heads=hf_config.num_attention_heads,
+            init_method_std=hf_config.initializer_range,
+            layernorm_epsilon=hf_config.rms_norm_eps,
+            num_query_groups=hf_config.num_key_value_heads,
+            seq_length=hf_config.max_position_embeddings,
+            rotary_base=rotary_base,
+            kv_channels=kv_channels,
+            gated_linear_unit=False,  # Apertus uses XIELU, NOT gated MLP
+            # Apertus-specific: QK normalization
+            qk_layernorm=getattr(hf_config, "qk_norm", True),
+            # RoPE scaling (native mcore llama3 passthrough, validated above)
+            rope_scaling=rope_scaling,
+            rope_scaling_factor=rope_scaling_factor,
+            make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(hf_config.vocab_size),
+            share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
+            fp16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16),
+            bf16=(self.dtype_from_hf(hf_config, default=torch.float32) == torch.bfloat16),
+            params_dtype=self.dtype_from_hf(hf_config, default=torch.float32),
+            vocab_size=hf_config.vocab_size,
+        )
+
         return provider
 
-    def load_weights_hf_to_megatron(self, hf_pretrained, megatron_model, allowed_mismatched_params=None):
-        models = super().load_weights_hf_to_megatron(
-            hf_pretrained, megatron_model, allowed_mismatched_params=allowed_mismatched_params
-        )
-        [
-            m._sync_runtime_scalars()
-            for model in unwrap_model(models)
-            for m in model.modules()
-            if isinstance(m, MCoreXIELU)
-        ]
-        return models
-
-    @classmethod
-    def megatron_to_hf_config(cls, provider):
-        config = super().megatron_to_hf_config(provider)
-        theta = float(provider.rotary_base)
-        rope = {
-            **(getattr(provider, "apertus_rope_scaling", None) or _ROPE_DEFAULTS),
-            "factor": float(provider.rope_scaling_factor),
-        }
-        rope["rope_type"] = rope["type"] = rope.get("rope_type", rope.get("type", "llama3"))
-        config.update(
-            hidden_act="xielu",
-            attention_bias=False,
-            rope_theta=theta,
-            rope_scaling=rope,
-            rope_parameters={**rope, "rope_theta": theta},
-        )
-        return config
-
     def mapping_registry(self) -> MegatronMappingRegistry:
-        L, H = "decoder.layers.*", "model.layers.*"
-        auto = {
+        """Return parameter mappings from Megatron to HF format.
+
+        Apertus uses different layernorm names and XIELU activation (not gated MLP).
+        """
+        # Register XIELU as replicated module type (learnable but not tensor-parallel)
+        AutoMapping.register_module_type("XIELU", "replicated")
+
+        # Apertus HF parameter names are different from standard Llama:
+        # - attention_layernorm instead of input_layernorm
+        # - feedforward_layernorm instead of post_attention_layernorm
+        # - q_norm/k_norm for QK normalization
+        # - No gate_proj (not gated MLP), just up_proj with XIELU activation
+        param_mappings = {
+            # Embeddings and output
             "embedding.word_embeddings.weight": "model.embed_tokens.weight",
             "output_layer.weight": "lm_head.weight",
             "decoder.final_layernorm.weight": "model.norm.weight",
-            f"{L}.self_attention.linear_proj.weight": f"{H}.self_attn.o_proj.weight",
-            f"{L}.self_attention.q_layernorm.weight": f"{H}.self_attn.q_norm.weight",
-            f"{L}.self_attention.k_layernorm.weight": f"{H}.self_attn.k_norm.weight",
-            f"{L}.mlp.linear_fc2.weight": f"{H}.mlp.down_proj.weight",
+            # Layer norms: TE-fused in Megatron (the provider always builds the
+            # TE spec); HF uses nonstandard names (attention_layernorm /
+            # feedforward_layernorm instead of input/post_attention_layernorm)
+            "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.attention_layernorm.weight",
+            "decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.feedforward_layernorm.weight",
+            # Attention output projection
+            "decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
+            # MLP (NOT gated - Apertus uses XIELU activation on up_proj directly)
+            "decoder.layers.*.mlp.linear_fc1.weight": "model.layers.*.mlp.up_proj.weight",
+            "decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
+            # QK normalization weights (Apertus-specific)
+            "decoder.layers.*.self_attention.q_layernorm.weight": "model.layers.*.self_attn.q_norm.weight",
+            "decoder.layers.*.self_attention.k_layernorm.weight": "model.layers.*.self_attn.k_norm.weight",
+            # XIELU activation parameters (Apertus-specific)
+            "decoder.layers.*.mlp.activation_func.alpha_p": "model.layers.*.mlp.act_fn.alpha_p",
+            "decoder.layers.*.mlp.activation_func.alpha_n": "model.layers.*.mlp.act_fn.alpha_n",
         }
-        repl = {
-            f"{L}.self_attention.linear_qkv.layer_norm_weight": f"{H}.attention_layernorm.weight",
-            f"{L}.mlp.linear_fc1.layer_norm_weight": f"{H}.feedforward_layernorm.weight",
-            **{f"{L}.mlp.activation_func.{n}": f"{H}.mlp.act_fn.{n}" for n in ("alpha_p", "alpha_n", "beta", "eps")},
-        }
-        qkv = QKVMapping(
-            f"{L}.self_attention.linear_qkv.weight",
-            q=f"{H}.self_attn.q_proj.weight",
-            k=f"{H}.self_attn.k_proj.weight",
-            v=f"{H}.self_attn.v_proj.weight",
+
+        mapping_list = []
+        for megatron_param, hf_param in param_mappings.items():
+            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
+
+        # Add QKV mapping (combine separate Q, K, V into single QKV matrix)
+        mapping_list.append(
+            QKVMapping(
+                megatron_param="decoder.layers.*.self_attention.linear_qkv.weight",
+                q="model.layers.*.self_attn.q_proj.weight",
+                k="model.layers.*.self_attn.k_proj.weight",
+                v="model.layers.*.self_attn.v_proj.weight",
+            ),
         )
-        qkv._tp_mapping = ColumnParallelMapping(qkv.megatron_param, qkv.megatron_param)
-        return MegatronMappingRegistry(
-            *(AutoMapping(m, h) for m, h in auto.items()),
-            *(ReplicatedMapping(m, h) for m, h in repl.items()),
-            qkv,
-            ColumnParallelMapping(f"{L}.mlp.linear_fc1.weight", f"{H}.mlp.up_proj.weight"),
-        )
+        # Note: No GatedMLPMapping - Apertus uses simple up_proj + XIELU, not gate_proj * up_proj
+
+        return MegatronMappingRegistry(*mapping_list)

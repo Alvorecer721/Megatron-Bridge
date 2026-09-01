@@ -23,7 +23,6 @@ multiple threads try to download and cache the same model simultaneously.
 import hashlib
 import os
 import time
-import contextlib
 from pathlib import Path
 from typing import Union
 
@@ -98,7 +97,7 @@ def safe_load_config_with_retry(
 
             lock_file.parent.mkdir(parents=True, exist_ok=True)
 
-            with contextlib.nullcontext():  # filelock disabled: config is written once by rank 0, read-only after; fcntl.flock is unsupported in-container on CSCS Lustre
+            with filelock.FileLock(str(lock_file) + ".lock", timeout=60):
                 return AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code, **kwargs)
 
         except Exception as e:
