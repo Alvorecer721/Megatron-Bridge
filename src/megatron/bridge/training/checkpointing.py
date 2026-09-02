@@ -1351,8 +1351,7 @@ def save_checkpoint(
                 save_strategy = checkpointing_context["save_strategy"]
                 # Already saved once before - don't need to rerun sharding validation
                 validate_sharding_integrity = (
-                    ckpt_cfg.ckpt_load_validate_sharding_integrity
-                    and not ckpt_cfg.ckpt_assume_constant_structure
+                    ckpt_cfg.ckpt_load_validate_sharding_integrity and not ckpt_cfg.ckpt_assume_constant_structure
                 )
             else:
                 validate_sharding_integrity = ckpt_cfg.ckpt_load_validate_sharding_integrity

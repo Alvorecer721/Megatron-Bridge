@@ -757,13 +757,9 @@ class TestSaveCheckpoint:
         save_checkpoint_fixtures["mock_state"].wandb_logger = Mock()
         save_checkpoint_fixtures["mock_state"].cfg.checkpoint.most_recent_k = -1
         save_checkpoint_fixtures["mock_state"].cfg.checkpoint.save_rng = save_rng
-        save_checkpoint_fixtures[
-            "mock_state"
-        ].cfg.checkpoint.ckpt_load_validate_sharding_integrity = False
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.ckpt_load_validate_sharding_integrity = False
         save_checkpoint_fixtures["mock_state"].cfg.checkpoint.fully_parallel_save = True
-        save_checkpoint_fixtures[
-            "mock_state"
-        ].cfg.checkpoint.ckpt_assume_constant_structure = False
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.ckpt_assume_constant_structure = False
 
         # Call save_checkpoint
         with patch(
@@ -793,9 +789,7 @@ class TestSaveCheckpoint:
             mock_get_rng.assert_called_once()
         else:
             mock_get_rng.assert_not_called()
-        assert (
-            mock_dist_ckpt.save.call_args.kwargs["validate_access_integrity"] is False
-        )
+        assert mock_dist_ckpt.save.call_args.kwargs["validate_access_integrity"] is False
 
         # Verify that the tracker file was written with the correct iteration
         tracker_calls = [
@@ -4593,9 +4587,7 @@ class TestCheckpointPathOverride:
         mock_pg.dp_cp = Mock()
 
         sharded_sd = {"weight": "placeholder"}
-        checkpoint_config = CheckpointConfig(
-            ckpt_load_validate_sharding_integrity=False
-        )
+        checkpoint_config = CheckpointConfig(ckpt_load_validate_sharding_integrity=False)
         state_dict, checkpoint_name, release, ckpt_type = _load_global_dist_base_checkpoint(
             load_dir="/should/not/be/used",
             ckpt_cfg=checkpoint_config,
