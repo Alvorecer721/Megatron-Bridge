@@ -1350,9 +1350,12 @@ def save_checkpoint(
             if checkpointing_context is not None and "save_strategy" in checkpointing_context:
                 save_strategy = checkpointing_context["save_strategy"]
                 # Already saved once before - don't need to rerun sharding validation
-                validate_sharding_integrity = not ckpt_cfg.ckpt_assume_constant_structure
+                validate_sharding_integrity = (
+                    ckpt_cfg.ckpt_load_validate_sharding_integrity
+                    and not ckpt_cfg.ckpt_assume_constant_structure
+                )
             else:
-                validate_sharding_integrity = True
+                validate_sharding_integrity = ckpt_cfg.ckpt_load_validate_sharding_integrity
                 if ckpt_cfg.ckpt_format == "torch_dist":
                     save_strategy = TorchDistSaveShardedStrategy(
                         "torch_dist",
@@ -1378,6 +1381,7 @@ def save_checkpoint(
                         save_strategy,
                         pg_collection.dp_cp,
                         ckpt_cfg.ckpt_assume_constant_structure,
+                        validate_access_integrity=ckpt_cfg.ckpt_load_validate_sharding_integrity,
                     )
             # MegatronMIMO + torch_dist can hit known access-pattern validation failures
             # for nested DDP language model tensors in PP>1 runs when
@@ -3645,7 +3649,7 @@ def _load_global_dist_base_checkpoint(
         load_strategy = FullyParallelLoadStrategyWrapper(load_strategy, pg_collection.dp_cp)
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
-    validate_sharding_integrity = True
+    validate_sharding_integrity = ckpt_cfg.ckpt_load_validate_sharding_integrity
     if is_megatron_mimo and ckpt_cfg.ckpt_format == "torch_dist" and not ckpt_cfg.fully_parallel_save:
         validate_sharding_integrity = False
     state_dict = dist_checkpointing.load(
