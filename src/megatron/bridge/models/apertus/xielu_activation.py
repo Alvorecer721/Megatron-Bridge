@@ -31,7 +31,9 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from megatron.core import parallel_state
 from megatron.core.jit import jit_fuser
+from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 
 
@@ -122,13 +124,30 @@ class XIELU(MegatronModule):
             return f"dtype {x.dtype}/{self.alpha_p.dtype} (kernel is bf16-only)"
         return f"numel {x.numel()} not divisible by 128"
 
+    def _tensor_parallel_alphas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return replicated alphas whose backward gradients are TP-summed.
+
+        FC1 partitions Apertus's FFN activations over tensor-parallel ranks, so
+        each rank computes only part of each shared alpha's gradient. MCore's
+        copy-to-TP autograd mapping is an identity in forward and a SUM
+        all-reduce in backward, producing the full gradient on every replica.
+        """
+        if not parallel_state.model_parallel_is_initialized():
+            return self.alpha_p, self.alpha_n
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        return (
+            copy_to_tensor_model_parallel_region(self.alpha_p, group=tp_group),
+            copy_to_tensor_model_parallel_region(self.alpha_n, group=tp_group),
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        alpha_p, alpha_n = self._tensor_parallel_alphas()
         if self._cuda_usable(x):
             self._log_once("cuda", "Apertus XIELU: using fused CUDA kernel (xielu extension)")
-            return _xielu_cuda(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
+            return _xielu_cuda(x, alpha_p, alpha_n, self.beta, self.eps)
         if "eager" not in XIELU._logged_paths:  # build the reason string only on first fallback
             self._log_once(
                 "eager",
                 f"Apertus XIELU: using eager fallback ({self._eager_reason(x)})",
             )
-        return compiled_xielu(x, self.alpha_p, self.alpha_n, self.beta, self.eps)
+        return compiled_xielu(x, alpha_p, alpha_n, self.beta, self.eps)
